@@ -25,6 +25,8 @@ import time
 
 
 ELEMENTS_PER_ARM = 8  # 7 joints + 1 gripper
+START_COMMANDS = {"start"}
+STOP_COMMANDS = {"stop", "success", "fail", "cancel", "quit"}
 
 
 # PCHIP interpolation for upsampling
@@ -226,6 +228,48 @@ def _blend_remaining(remaining_raw_positions, next_positions):
     return np.concatenate([blended, next_positions[n:]])
 
 
+def _clear_queue(queue):
+    while not queue.empty():
+        queue.get_nowait()
+
+
+def _command_value(event):
+    return event["value"][0].as_py()
+
+
+async def _get_next_input(action_queue, command_queue):
+    if not command_queue.empty():
+        return "command", command_queue.get_nowait()
+    if not action_queue.empty():
+        return "actions", action_queue.get_nowait()
+
+    action_task = asyncio.create_task(action_queue.get())
+    command_task = asyncio.create_task(command_queue.get())
+    done, pending = await asyncio.wait(
+        {action_task, command_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    if command_task in done:
+        if action_task in done:
+            # A command wins races against an action; the action may be stale.
+            action_task.result()
+        return "command", command_task.result()
+    return "actions", action_task.result()
+
+
+def _apply_command(event, action_queue):
+    command = _command_value(event)
+    _clear_queue(action_queue)
+    enabled = command in START_COMMANDS
+    if command in START_COMMANDS | STOP_COMMANDS:
+        print(f"actions-executor command={command}: reset state, enabled={enabled}", flush=True)
+    return enabled, None, _ProcessorState()
+
+
 def _split_arm_positions(position, arms):
     offset = 0
     if "right" in arms:
@@ -275,7 +319,9 @@ def _send_arm_outputs(node, right_position, left_position, timestamp):
             )
 
 
-async def _main_executor(node, latest_event, arms, use_upsample, use_filter, control_hz):
+async def _main_executor(
+    node, action_queue, command_queue, arms, use_upsample, use_filter, control_hz
+):
     if not use_upsample and use_filter:
         print(
             "Warning: upsample is False, but filter is True. Forcing filter to False."
@@ -284,9 +330,18 @@ async def _main_executor(node, latest_event, arms, use_upsample, use_filter, con
 
     remaining_raw_positions = None
     processor_state = _ProcessorState()
+    enabled = False
 
     while True:
-        event = await latest_event.get()
+        event_id, event = await _get_next_input(action_queue, command_queue)
+        if event_id == "command":
+            enabled, remaining_raw_positions, processor_state = _apply_command(
+                event, action_queue
+            )
+            continue
+        if not enabled:
+            continue
+
         chunk = _parse_event(event)
         processor_state = _build_or_validate_processors(
             chunk,
@@ -327,8 +382,15 @@ async def _main_executor(node, latest_event, arms, use_upsample, use_filter, con
             base_time = next_base_time
             timestamp = time.time_ns()
 
+            if not command_queue.empty():
+                event = command_queue.get_nowait()
+                enabled, remaining_raw_positions, processor_state = _apply_command(
+                    event, action_queue
+                )
+                break
+
             # If there is a new event, cancel the current event.
-            if not latest_event.empty():
+            if not action_queue.empty():
                 if use_upsample:
                     consumed_time_s = i_step * step_interval_s
                     consumed_raw_steps = int(
@@ -344,30 +406,33 @@ async def _main_executor(node, latest_event, arms, use_upsample, use_filter, con
             _send_arm_outputs(node, right_position, left_position, timestamp)
 
 
-def _put_latest(latest_event, event):
-    while not latest_event.empty():
-        latest_event.get_nowait()
-    latest_event.put_nowait(event)
+def _put_latest(queue, event):
+    _clear_queue(queue)
+    queue.put_nowait(event)
 
 
-async def _main_dora(node, latest_event, executor_task):
+async def _main_dora(node, action_queue, command_queue, executor_task):
     while True:
         event = await asyncio.to_thread(node.next)
         if event["type"] != "INPUT":
             break
 
-        # Main process
-        _put_latest(latest_event, event)
+        event_id = event["id"]
+        if event_id == "actions":
+            _put_latest(action_queue, event)
+        elif event_id == "command":
+            _put_latest(command_queue, event)
     executor_task.cancel()
 
 
 async def _main_async(arms, use_upsample, use_filter, control_hz):
     node = dora.Node()
-    latest_event = asyncio.Queue(maxsize=1)
+    action_queue = asyncio.Queue(maxsize=1)
+    command_queue = asyncio.Queue(maxsize=1)
     executor_task = asyncio.create_task(
-        _main_executor(node, latest_event, arms, use_upsample, use_filter, control_hz)
+        _main_executor(node, action_queue, command_queue, arms, use_upsample, use_filter, control_hz)
     )
-    dora_task = asyncio.create_task(_main_dora(node, latest_event, executor_task))
+    dora_task = asyncio.create_task(_main_dora(node, action_queue, command_queue, executor_task))
 
     try:
         await executor_task
