@@ -25,8 +25,10 @@ import time
 
 
 ELEMENTS_PER_ARM = 8  # 7 joints + 1 gripper
+# Intervention is one-way for the rest of the episode: once "intervene"
+# disables the executor, only the next "start" (new episode) re-enables it.
 START_COMMANDS = {"start"}
-STOP_COMMANDS = {"stop", "success", "fail", "cancel", "quit"}
+STOP_COMMANDS = {"stop", "success", "fail", "cancel", "quit", "intervene"}
 
 
 # PCHIP interpolation for upsampling
