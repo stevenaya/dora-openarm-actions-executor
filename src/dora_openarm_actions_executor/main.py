@@ -12,297 +12,509 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Node to execute timestamped actions."""
+"""Execute policy action chunks on OpenArm."""
 
 import argparse
 import asyncio
-import dora
 import os
+import time
+from dataclasses import dataclass
+
+import dora
 import numpy as np
 import pyarrow as pa
-import time
 
 
-# Hermite cubic spline interpolation for upsampling
-class HermiteUpsampler:
-    """Upsamples coarse trajectory chunks using cubic Hermite spline interpolation."""
+ELEMENTS_PER_ARM = 8
+ACTION_TYPE = pa.list_(pa.float32())
+QPOS_TYPE = pa.struct([("qpos", pa.list_(pa.float32()))])
+INTERPOLATION_METHODS = {"hermite", "pchip"}
+START_COMMANDS = {"start"}
+STOP_COMMANDS = {"stop", "intervene", "quit"}
 
-    def __init__(self, chunk_hz, horizon_sec):
-        """Initialize the upsampler with the chunk frequency and horizon."""
-        self.chunk_hz = float(chunk_hz)
-        self.horizon_sec = float(horizon_sec)
-        self.dt_chunk = 1.0 / self.chunk_hz
-        self.t_chunk = np.arange(0.0, self.horizon_sec + 1e-12, self.dt_chunk)
+
+class TrajectoryInterpolator:
+    """Interpolate a position trajectory on its policy time axis."""
+
+    def __init__(self, positions, interval_s, method):
+        """Build an interpolator for one action chunk."""
+        if method not in INTERPOLATION_METHODS:
+            raise ValueError(f"Unsupported interpolation method: {method}")
+        if interval_s <= 0:
+            raise ValueError("Action interval must be positive")
+
+        self.positions = np.asarray(positions, dtype=np.float64)
+        if self.positions.ndim != 2 or len(self.positions) == 0:
+            raise ValueError("Action chunk must be a non-empty 2D array")
+
+        self.interval_s = float(interval_s)
+        self.method = method
+        self.times = np.arange(len(self.positions), dtype=np.float64) * self.interval_s
+        self.slopes = self._compute_slopes()
+
+    @property
+    def horizon_s(self):
+        """Return the trajectory duration."""
+        return float(self.times[-1])
 
     @staticmethod
-    def _compute_slopes(t, y):
-        s = np.diff(y, axis=0) / np.diff(t)[:, None]
-        m = np.zeros_like(y)
-        m[0] = s[0]
-        m[-1] = s[-1]
-        for i in range(1, len(y) - 1):
-            prod = s[i - 1] * s[i]
-            mask = prod <= 0.0
-            mi = 0.5 * (s[i - 1] + s[i])
-            mi[mask] = 0.0
-            m[i] = mi
-        return m
+    def _edge_slope(h0, h1, slope0, slope1):
+        slope = ((2.0 * h0 + h1) * slope0 - h0 * slope1) / (h0 + h1)
+        opposite_sign = np.sign(slope) != np.sign(slope0)
+        too_steep = (np.sign(slope0) != np.sign(slope1)) & (
+            np.abs(slope) > 3.0 * np.abs(slope0)
+        )
+        slope[opposite_sign] = 0.0
+        slope[~opposite_sign & too_steep] = 3.0 * slope0[~opposite_sign & too_steep]
+        return slope
 
-    def upsample(self, y_chunk, t_eval):
-        """Upsample the given chunk of trajectory to the specified evaluation times."""
-        y = np.asarray(y_chunk, dtype=np.float32)
-        if y.shape[0] != len(self.t_chunk):
-            raise ValueError(
-                f"Expected chunk length {len(self.t_chunk)}, got {y.shape[0]}"
+    def _hermite_slopes(self):
+        if len(self.positions) == 1:
+            return np.zeros_like(self.positions)
+
+        secants = np.diff(self.positions, axis=0) / self.interval_s
+        slopes = np.zeros_like(self.positions)
+        slopes[0] = secants[0]
+        slopes[-1] = secants[-1]
+        for index in range(1, len(self.positions) - 1):
+            slope = 0.5 * (secants[index - 1] + secants[index])
+            slope[secants[index - 1] * secants[index] <= 0.0] = 0.0
+            slopes[index] = slope
+        return slopes
+
+    def _pchip_slopes(self):
+        if len(self.positions) <= 2:
+            return self._hermite_slopes()
+
+        intervals = np.diff(self.times)
+        secants = np.diff(self.positions, axis=0) / intervals[:, None]
+        slopes = np.zeros_like(self.positions)
+
+        previous_interval = intervals[:-1, None]
+        next_interval = intervals[1:, None]
+        previous_secant = secants[:-1]
+        next_secant = secants[1:]
+        same_sign = previous_secant * next_secant > 0.0
+        weight1 = 2.0 * next_interval + previous_interval
+        weight2 = next_interval + 2.0 * previous_interval
+        with np.errstate(divide="ignore", invalid="ignore"):
+            interior = (weight1 + weight2) / (
+                weight1 / previous_secant + weight2 / next_secant
             )
+        slopes[1:-1] = np.where(same_sign, interior, 0.0)
+        slopes[0] = self._edge_slope(
+            intervals[0],
+            intervals[1],
+            secants[0],
+            secants[1],
+        )
+        slopes[-1] = self._edge_slope(
+            intervals[-1],
+            intervals[-2],
+            secants[-1],
+            secants[-2],
+        )
+        return slopes
 
-        slopes = self._compute_slopes(self.t_chunk, y)
-        idx = np.searchsorted(self.t_chunk, t_eval, side="right") - 1
-        idx = np.clip(idx, 0, len(self.t_chunk) - 2)
+    def _compute_slopes(self):
+        if self.method == "pchip":
+            return self._pchip_slopes()
+        return self._hermite_slopes()
 
-        t0 = self.t_chunk[idx]
-        t1 = self.t_chunk[idx + 1]
-        h = t1 - t0
-        u = (t_eval - t0) / h
+    def sample(self, sample_times):
+        """Sample positions at times measured from the chunk start."""
+        sample_times = np.asarray(sample_times, dtype=np.float64)
+        if len(self.positions) == 1:
+            return np.repeat(
+                self.positions,
+                len(sample_times),
+                axis=0,
+            ).astype(np.float32)
 
-        h00 = 2 * u**3 - 3 * u**2 + 1
-        h10 = (u**3 - 2 * u**2 + u) * h
-        h01 = -2 * u**3 + 3 * u**2
-        h11 = (u**3 - u**2) * h
+        sample_times = np.clip(sample_times, 0.0, self.horizon_s)
+        indices = np.searchsorted(self.times, sample_times, side="right") - 1
+        indices = np.clip(indices, 0, len(self.times) - 2)
 
-        y0 = y[idx]
-        y1 = y[idx + 1]
-        m0 = slopes[idx]
-        m1 = slopes[idx + 1]
+        t0 = self.times[indices]
+        t1 = self.times[indices + 1]
+        duration = t1 - t0
+        phase = (sample_times - t0) / duration
+
+        h00 = 2 * phase**3 - 3 * phase**2 + 1
+        h10 = (phase**3 - 2 * phase**2 + phase) * duration
+        h01 = -2 * phase**3 + 3 * phase**2
+        h11 = (phase**3 - phase**2) * duration
 
         return (
-            h00[:, None] * y0
-            + h10[:, None] * m0
-            + h01[:, None] * y1
-            + h11[:, None] * m1
+            h00[:, None] * self.positions[indices]
+            + h10[:, None] * self.slopes[indices]
+            + h01[:, None] * self.positions[indices + 1]
+            + h11[:, None] * self.slopes[indices + 1]
         ).astype(np.float32)
 
 
-# Tustin bilinear transform based biquad low-pass filter
 class BiquadLowpass:
-    """Biquad low-pass filter for smoothing outputs."""
+    """Smooth position commands with a Tustin biquad low-pass filter."""
 
-    def __init__(self, fs, fc, Q=0.707):
-        """Initialize the biquad low-pass filter with sampling frequency, cutoff frequency, and Q factor."""
-        fs = float(fs)
-        fc = float(fc)
-        Q = float(Q)
-        w0 = 2 * np.pi * fc / fs
-        cosw0 = np.cos(w0)
-        alpha = np.sin(w0) / (2 * Q)
+    def __init__(self, sample_hz, cutoff_hz, quality=0.707):
+        """Create a low-pass filter."""
+        sample_hz = float(sample_hz)
+        cutoff_hz = float(cutoff_hz)
+        quality = float(quality)
+        if not 0.0 < cutoff_hz < sample_hz / 2.0:
+            raise ValueError("Filter cutoff must be between zero and Nyquist")
+
+        angular_frequency = 2 * np.pi * cutoff_hz / sample_hz
+        cosine = np.cos(angular_frequency)
+        alpha = np.sin(angular_frequency) / (2 * quality)
         a0 = 1 + alpha
-        self.b0 = ((1 - cosw0) / 2) / a0
-        self.b1 = (1 - cosw0) / a0
-        self.b2 = ((1 - cosw0) / 2) / a0
-        self.a1 = (-2 * cosw0) / a0
+        self.b0 = ((1 - cosine) / 2) / a0
+        self.b1 = (1 - cosine) / a0
+        self.b2 = ((1 - cosine) / 2) / a0
+        self.a1 = (-2 * cosine) / a0
         self.a2 = (1 - alpha) / a0
         self.x1 = None
         self.x2 = None
         self.y1 = None
         self.y2 = None
 
-    def reset_state(self, initial_x):
-        """Reset the filter state with the initial input value."""
-        initial_x = np.asarray(initial_x, dtype=np.float32)
-        self.x1 = initial_x.copy()
-        self.x2 = initial_x.copy()
-        self.y1 = initial_x.copy()
-        self.y2 = initial_x.copy()
+    def reset_state(self, position):
+        """Initialize filter memory at a position without a startup transient."""
+        position = np.asarray(position, dtype=np.float32)
+        self.x1 = position.copy()
+        self.x2 = position.copy()
+        self.y1 = position.copy()
+        self.y2 = position.copy()
 
-    def step(self, x):
-        """Apply one step of the biquad low-pass filter to the input x."""
-        x = np.asarray(x, dtype=np.float32)
+    def step(self, position):
+        """Filter one position sample."""
+        position = np.asarray(position, dtype=np.float32)
         if self.x1 is None:
-            self.reset_state(x)
-        y = (
-            self.b0 * x
+            self.reset_state(position)
+        output = (
+            self.b0 * position
             + self.b1 * self.x1
             + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2
         )
-        self.x2, self.x1 = self.x1, x
-        self.y2, self.y1 = self.y1, y
-        return y.astype(np.float32)
+        self.x2, self.x1 = self.x1, position
+        self.y2, self.y1 = self.y1, output
+        return output.astype(np.float32)
 
 
-async def _main_executor(node, events, arms, use_upsample, use_filter, control_hz):
-    def blend(canceled_positions, next_positions):
-        n = len(canceled_positions)
-        overlapped_positions = next_positions[:n]
-        weights = np.linspace(1, 0, n, dtype=np.float32).reshape(n, 1)
-        blended = canceled_positions * weights + overlapped_positions * (1 - weights)
-        return blended, n
+@dataclass
+class _ActionChunk:
+    positions: np.ndarray
+    interval_ns: int
+    cutoff_hz: float
+    reset: bool
 
-    if not use_upsample and use_filter:
-        print(
-            "Warning: upsample is False, but filter is True. Forcing filter to False."
+    @property
+    def interval_s(self):
+        return self.interval_ns / 1_000_000_000
+
+
+def _parse_action(event):
+    value = event["value"]
+    if value.type != ACTION_TYPE or len(value) == 0:
+        raise ValueError("Actions must be a non-empty list<float32> array")
+
+    width = len(value[0])
+    if width == 0 or any(len(value[index]) != width for index in range(len(value))):
+        raise ValueError("Every action in a chunk must have the same non-zero width")
+
+    interval_ns = int(event["metadata"]["interval"])
+    if interval_ns <= 0:
+        raise ValueError("Action interval must be positive")
+
+    return _ActionChunk(
+        positions=value.values.to_numpy().reshape(len(value), width),
+        interval_ns=interval_ns,
+        cutoff_hz=float(event["metadata"].get("cutoff_hz", 15.0)),
+        reset=bool(event["metadata"].get("reset", False)),
+    )
+
+
+def _blend_trajectories(previous, current):
+    if previous is None or len(previous) == 0:
+        return current
+
+    count = min(len(previous), len(current))
+    output = current.copy()
+    weights = np.linspace(1.0, 0.0, count, dtype=np.float32)[:, None]
+    output[:count] = previous[:count] * weights + current[:count] * (1.0 - weights)
+    return output
+
+
+def _remaining_policy_trajectory(
+    interpolator,
+    last_sent_position,
+    last_sent_time,
+):
+    if last_sent_position is None or last_sent_time is None:
+        return None
+
+    future_times = np.arange(
+        last_sent_time + interpolator.interval_s,
+        interpolator.horizon_s + 1e-12,
+        interpolator.interval_s,
+    )
+    if len(future_times) == 0:
+        return last_sent_position[None, :]
+
+    return np.concatenate(
+        [
+            last_sent_position[None, :],
+            interpolator.sample(future_times),
+        ]
+    )
+
+
+def _control_trajectory(interpolator, use_upsample, control_hz):
+    if not use_upsample:
+        return (
+            interpolator.times,
+            interpolator.positions.astype(np.float32),
+            int(interpolator.interval_s * 1_000_000_000),
         )
+
+    control_interval_s = 1.0 / float(control_hz)
+    duration_s = max(interpolator.horizon_s, interpolator.interval_s)
+    sample_times = np.arange(0.0, duration_s + 1e-12, control_interval_s)
+    return (
+        sample_times,
+        interpolator.sample(sample_times),
+        int(control_interval_s * 1_000_000_000),
+    )
+
+
+def _clear_queue(queue):
+    while not queue.empty():
+        queue.get_nowait()
+
+
+def _put_latest(queue, event):
+    _clear_queue(queue)
+    queue.put_nowait(event)
+
+
+def _put_action(queue, event):
+    if bool(event["metadata"].get("reset", False)):
+        _clear_queue(queue)
+    if queue.maxsize > 0:
+        while queue.full():
+            queue.get_nowait()
+    queue.put_nowait(event)
+
+
+async def _next_input(action_queue, command_queue):
+    if not command_queue.empty():
+        return "command", command_queue.get_nowait()
+    if not action_queue.empty():
+        return "actions", action_queue.get_nowait()
+
+    action_task = asyncio.create_task(action_queue.get())
+    command_task = asyncio.create_task(command_queue.get())
+    done, pending = await asyncio.wait(
+        {action_task, command_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    if command_task in done:
+        if action_task in done:
+            action_task.result()
+        return "command", command_task.result()
+    return "actions", action_task.result()
+
+
+def _apply_command(event, action_queue):
+    command = event["value"][0].as_py()
+    if command in START_COMMANDS:
+        enabled = True
+    elif command in STOP_COMMANDS:
+        enabled = False
+    else:
+        return None
+
+    _clear_queue(action_queue)
+    print(
+        f"actions-executor command={command}: reset state, enabled={enabled}",
+        flush=True,
+    )
+    return enabled
+
+
+def _split_positions(position, arms):
+    expected_width = ELEMENTS_PER_ARM * len(arms)
+    if len(position) != expected_width:
+        raise ValueError(
+            f"Expected {expected_width} action values for {arms}, got {len(position)}"
+        )
+
+    positions = {}
+    offset = 0
+    for arm in arms:
+        positions[arm] = position[offset : offset + ELEMENTS_PER_ARM]
+        offset += ELEMENTS_PER_ARM
+    return positions
+
+
+def _qpos_output(position):
+    return pa.array(
+        [{"qpos": np.asarray(position, dtype=np.float32)}],
+        type=QPOS_TYPE,
+    )
+
+
+def _send_positions(node, position, arms):
+    timestamp = time.time_ns()
+    for arm, arm_position in _split_positions(position, arms).items():
+        node.send_output(
+            f"move_position_{arm}",
+            _qpos_output(arm_position),
+            {"timestamp": timestamp},
+        )
+
+
+async def _main_executor(
+    node,
+    action_queue,
+    command_queue,
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    interpolation,
+):
+    if use_filter and not use_upsample:
+        print("Filter requires upsampling; disabling filter.", flush=True)
         use_filter = False
 
-    canceled_positions = None
-
-    upsampler = None
+    enabled = False
+    remaining_trajectory = None
     lowpass = None
-    dynamic_chunk_hz = None
-    target_interval_ns = None
-    target_interval_s = None
-    t_eval = None
 
     while True:
-        event = await events.get()
-        interval = event["metadata"]["interval"]
-        # Filter cutoff frequency is 15 Hz by default, which is a common choice for robotic arm control to balance smoothness and responsiveness.
-        cutoff = event["metadata"].get("cutoff_hz", 15)
-        n_positions = len(event["value"])
-        pos_shape = len(event["value"][0])
-        reset = event["metadata"].get("reset", False)
-        positions = event["value"].values.to_numpy().reshape(n_positions, pos_shape)
+        event_type, event = await _next_input(action_queue, command_queue)
+        if event_type == "command":
+            new_enabled = _apply_command(event, action_queue)
+            if new_enabled is not None:
+                enabled = new_enabled
+                remaining_trajectory = None
+                lowpass = None
+            continue
+        if not enabled:
+            continue
 
-        # Initialize upsampler and low-pass filter if needed
-        if use_upsample and upsampler is None:
-            dynamic_chunk_hz = 1e9 / interval
-            horizon_sec = (n_positions - 1) / dynamic_chunk_hz
+        chunk = _parse_action(event)
+        if chunk.reset:
+            remaining_trajectory = None
 
-            upsampler = HermiteUpsampler(
-                chunk_hz=dynamic_chunk_hz, horizon_sec=horizon_sec
-            )
+        positions = _blend_trajectories(
+            remaining_trajectory,
+            chunk.positions,
+        )
+        remaining_trajectory = None
+        interpolator = TrajectoryInterpolator(
+            positions,
+            chunk.interval_s,
+            interpolation,
+        )
+        sample_times, control_positions, step_interval_ns = _control_trajectory(
+            interpolator,
+            use_upsample,
+            control_hz,
+        )
 
-            target_interval_s = 1.0 / float(control_hz)
-            target_interval_ns = int(target_interval_s * 1e9)
+        if use_filter and lowpass is None:
+            lowpass = BiquadLowpass(control_hz, chunk.cutoff_hz)
+        if chunk.reset and lowpass is not None:
+            print("Resetting trajectory and filter state.", flush=True)
+            lowpass.reset_state(positions[0])
 
-            t_eval = np.arange(0.0, horizon_sec + 1e-9, target_interval_s)
+        last_sent_position = None
+        last_sent_time = None
+        next_send_ns = time.monotonic_ns()
 
-            if use_filter:
-                lowpass = BiquadLowpass(fs=control_hz, fc=cutoff)
+        for sample_time, raw_position in zip(
+            sample_times,
+            control_positions,
+            strict=True,
+        ):
+            sleep_ns = next_send_ns - time.monotonic_ns()
+            if sleep_ns > 0:
+                await asyncio.sleep(sleep_ns / 1_000_000_000)
 
-        # On a reset, these actions are the first of a new episode, so drop any
-        # trajectory carried over from the previous one instead of blending it.
-        if reset:
-            print("Resetting trajectory, discarding any previous trajectory.")
-            canceled_positions = None
-            # Also re-initialize the low-pass filter to the new episode's first
-            # pose. Otherwise its retained state pulls the first samples toward
-            # the previous episode's final pose, causing a jerk/ramp at start.
-            # positions[0] equals the first upsampled sample (Hermite at t=0).
-            if lowpass is not None:
-                lowpass.reset_state(positions[0])
+            if not command_queue.empty():
+                command = command_queue.get_nowait()
+                new_enabled = _apply_command(command, action_queue)
+                if new_enabled is not None:
+                    enabled = new_enabled
+                    remaining_trajectory = None
+                    lowpass = None
+                    break
 
-        # blend trajectory
-        if canceled_positions is not None:
-            blended, n = blend(canceled_positions, positions)
-            positions = np.concatenate([blended, positions[n:]])
-            canceled_positions = None
-
-        # Conditionally upsample
-        if use_upsample:
-            loop_positions = upsampler.upsample(positions, t_eval)
-            step_interval_ns = target_interval_ns
-            step_interval_s = target_interval_s
-        else:
-            loop_positions = positions
-            step_interval_ns = interval
-            step_interval_s = interval / 1e9
-
-        # send motor command
-        base_time = time.time_ns() - step_interval_ns
-
-        for i_step, position in enumerate(loop_positions):
-            # Conditionally apply low-pass filter
-            if use_filter and lowpass is not None:
-                position = lowpass.step(position)
-
-            next_base_time = base_time + step_interval_ns
-            sleep_time = next_base_time - time.time_ns()
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time / 1e9)
-
-            base_time = next_base_time
-            timestamp = time.time_ns()
-
-            # If there is a new event, cancel the current event.
-            if not events.empty():
-                if use_upsample:
-                    consumed_time_s = i_step * step_interval_s
-                    consumed_raw_steps = int(consumed_time_s * dynamic_chunk_hz)
-                else:
-                    # If not upsampling, i_step corresponds directly to the original steps
-                    consumed_raw_steps = i_step
-                canceled_positions = positions[consumed_raw_steps:]
+            if not action_queue.empty():
+                remaining_trajectory = _remaining_policy_trajectory(
+                    interpolator,
+                    last_sent_position,
+                    last_sent_time,
+                )
                 break
 
-            offset = 0
-            n_elements = 8  # 7 joints + 1 gripper
-            if "right" in arms:
-                right_position = position[offset : offset + n_elements]
-                offset += n_elements
-            else:
-                right_position = None
-            if "left" in arms:
-                left_position = position[offset : offset + n_elements]
-                offset += n_elements
-            else:
-                left_position = None
-            if right_position is not None:
-                if left_position is None:
-                    node.send_output(
-                        "move_position_right",
-                        right_position,
-                        {"timestamp": timestamp},
-                    )
-                else:
-                    node.send_output(
-                        "move_position_right",
-                        pa.StructArray.from_arrays(
-                            [right_position, left_position],
-                            names=("new_position", "other_arm_position"),
-                        ),
-                        {"timestamp": timestamp},
-                    )
-            if left_position is not None:
-                if right_position is None:
-                    node.send_output(
-                        "move_position_left",
-                        left_position,
-                        {"timestamp": timestamp},
-                    )
-                else:
-                    node.send_output(
-                        "move_position_left",
-                        pa.StructArray.from_arrays(
-                            [left_position, right_position],
-                            names=("new_position", "other_arm_position"),
-                        ),
-                        {"timestamp": timestamp},
-                    )
+            position = raw_position
+            if lowpass is not None:
+                position = lowpass.step(position)
+            _send_positions(node, position, arms)
+            last_sent_position = np.asarray(position, dtype=np.float32).copy()
+            last_sent_time = float(sample_time)
+            next_send_ns += step_interval_ns
 
 
-async def _main_dora(node, events, executor_task):
+async def _main_dora(node, action_queue, command_queue, executor_task):
     while True:
-        if node.is_empty():
-            await asyncio.sleep(0.1)
-            continue
-        event = node.next()
+        event = await asyncio.to_thread(node.next)
         if event["type"] != "INPUT":
             break
 
-        # Main process
-        await events.put(event)
+        if event["id"] == "actions":
+            _put_action(action_queue, event)
+        elif event["id"] == "command":
+            _put_latest(command_queue, event)
+
     executor_task.cancel()
 
 
-async def _main_async(arms, use_upsample, use_filter, control_hz):
+async def _main_async(
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    action_queue_size,
+    interpolation,
+):
     node = dora.Node()
-    events = asyncio.Queue()
+    action_queue = asyncio.Queue(maxsize=action_queue_size)
+    command_queue = asyncio.Queue(maxsize=1)
     executor_task = asyncio.create_task(
-        _main_executor(node, events, arms, use_upsample, use_filter, control_hz)
+        _main_executor(
+            node,
+            action_queue,
+            command_queue,
+            arms,
+            use_upsample,
+            use_filter,
+            control_hz,
+            interpolation,
+        )
     )
-    dora_task = asyncio.create_task(_main_dora(node, events, executor_task))
+    dora_task = asyncio.create_task(
+        _main_dora(node, action_queue, command_queue, executor_task)
+    )
 
     try:
         await executor_task
@@ -312,40 +524,61 @@ async def _main_async(arms, use_upsample, use_filter, control_hz):
 
 
 def main():
-    """Execute timestamped actions."""
-    parser = argparse.ArgumentParser(description="Execute timestamped actions")
+    """Execute policy action chunks."""
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--arms",
         default=os.getenv("ARMS", "right,left"),
-        help="The used arms: 'right,left' (default), 'right' or 'left'",
-        type=str,
+        help="Comma-separated arm sides",
     )
     parser.add_argument(
         "--upsample",
         action="store_true",
-        help="Whether to upsample the actions",
+        help="Upsample policy actions to the motor control rate",
     )
     parser.add_argument(
         "--filter",
         action="store_true",
-        help="Whether to apply low-pass filter to the upsampled actions (only works if `upsample` is set)",
+        help="Low-pass filter upsampled motor commands",
     )
     parser.add_argument(
         "--control-hz",
         default=250.0,
         type=float,
-        help="motor control frequency (Hz)",
+        help="Motor control frequency",
     )
-
+    parser.add_argument(
+        "--interpolation",
+        default=os.getenv("ACTION_INTERPOLATION", "hermite"),
+        choices=sorted(INTERPOLATION_METHODS),
+        help="Trajectory interpolation method",
+    )
+    parser.add_argument(
+        "--action-queue-size",
+        default=int(os.getenv("ACTION_QUEUE_SIZE", "1")),
+        type=int,
+        help="Buffered action chunks; 0 means unbounded",
+    )
     args = parser.parse_args()
+
     arms = args.arms.split(",")
+    if not arms or len(set(arms)) != len(arms):
+        raise ValueError("--arms must contain unique arm sides")
+    if any(arm not in {"right", "left"} for arm in arms):
+        raise ValueError("--arms must contain only 'right' and/or 'left'")
+    if args.control_hz <= 0:
+        raise ValueError("--control-hz must be positive")
+    if args.action_queue_size < 0:
+        raise ValueError("--action-queue-size must be non-negative")
 
     asyncio.run(
         _main_async(
             arms,
-            use_upsample=args.upsample,
-            use_filter=args.filter,
-            control_hz=args.control_hz,
+            args.upsample,
+            args.filter,
+            args.control_hz,
+            args.action_queue_size,
+            args.interpolation,
         )
     )
 
