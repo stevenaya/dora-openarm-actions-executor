@@ -24,6 +24,8 @@ import time
 
 
 QPOS_TYPE = pa.struct([("qpos", pa.list_(pa.float32()))])
+START_COMMANDS = {"start"}
+STOP_COMMANDS = {"stop", "intervene", "quit"}
 
 
 # Hermite cubic spline interpolation for upsampling
@@ -134,22 +136,116 @@ class BiquadLowpass:
         return y.astype(np.float32)
 
 
-async def _main_executor(node, events, arms, use_upsample, use_filter, control_hz):
-    def blend(canceled_positions, next_positions):
-        n = len(canceled_positions)
-        overlapped_positions = next_positions[:n]
-        weights = np.linspace(1, 0, n, dtype=np.float32).reshape(n, 1)
-        blended = canceled_positions * weights + overlapped_positions * (1 - weights)
-        return blended, n
+def _blend_trajectories(previous, current):
+    if previous is None or len(previous) == 0:
+        return current
 
+    count = min(len(previous), len(current))
+    output = current.copy()
+    weights = np.linspace(1.0, 0.0, count, dtype=np.float32)[:, None]
+    output[:count] = previous[:count] * weights + current[:count] * (1.0 - weights)
+    return output
+
+
+def _remaining_policy_trajectory(
+    upsampler,
+    positions,
+    last_sent_position,
+    last_sent_time,
+):
+    if last_sent_position is None or last_sent_time is None:
+        return None
+
+    future_times = np.arange(
+        last_sent_time + upsampler.dt_chunk,
+        upsampler.horizon_sec + 1e-12,
+        upsampler.dt_chunk,
+    )
+    if len(future_times) == 0:
+        return last_sent_position[None, :]
+
+    return np.concatenate(
+        [
+            last_sent_position[None, :],
+            upsampler.upsample(positions, future_times),
+        ]
+    )
+
+
+def _clear_queue(queue):
+    while not queue.empty():
+        queue.get_nowait()
+
+
+def _put_latest(queue, event):
+    _clear_queue(queue)
+    queue.put_nowait(event)
+
+
+async def _next_input(action_queue, command_queue):
+    if not command_queue.empty():
+        return "command", command_queue.get_nowait()
+    if not action_queue.empty():
+        return "actions", action_queue.get_nowait()
+
+    action_task = asyncio.create_task(action_queue.get())
+    command_task = asyncio.create_task(command_queue.get())
+    done, pending = await asyncio.wait(
+        {action_task, command_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    if command_task in done:
+        if action_task in done:
+            action_task.result()
+        return "command", command_task.result()
+    return "actions", action_task.result()
+
+
+def _apply_command(event, action_queue):
+    command = event["value"][0].as_py()
+    if command in START_COMMANDS:
+        enabled = True
+    elif command in STOP_COMMANDS:
+        enabled = False
+    else:
+        return None
+
+    _clear_queue(action_queue)
+    print(
+        f"actions-executor command={command}: reset state, enabled={enabled}",
+        flush=True,
+    )
+    return enabled
+
+
+def _qpos_output(position):
+    return pa.array(
+        [{"qpos": np.asarray(position, dtype=np.float32)}],
+        type=QPOS_TYPE,
+    )
+
+
+async def _main_executor(
+    node,
+    action_queue,
+    command_queue,
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+):
     if not use_upsample and use_filter:
         print(
             "Warning: upsample is False, but filter is True. Forcing filter to False."
         )
         use_filter = False
 
+    enabled = False
     canceled_positions = None
-
     upsampler = None
     lowpass = None
     dynamic_chunk_hz = None
@@ -158,7 +254,22 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
     t_eval = None
 
     while True:
-        event = await events.get()
+        event_id, event = await _next_input(action_queue, command_queue)
+        if event_id == "command":
+            new_enabled = _apply_command(event, action_queue)
+            if new_enabled is not None:
+                enabled = new_enabled
+                canceled_positions = None
+                upsampler = None
+                lowpass = None
+                dynamic_chunk_hz = None
+                target_interval_ns = None
+                target_interval_s = None
+                t_eval = None
+            continue
+        if not enabled:
+            continue
+
         interval = event["metadata"]["interval"]
         # Filter cutoff frequency is 15 Hz by default, which is a common choice for robotic arm control to balance smoothness and responsiveness.
         cutoff = event["metadata"].get("cutoff_hz", 15)
@@ -197,10 +308,8 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
                 lowpass.reset_state(positions[0])
 
         # blend trajectory
-        if canceled_positions is not None:
-            blended, n = blend(canceled_positions, positions)
-            positions = np.concatenate([blended, positions[n:]])
-            canceled_positions = None
+        positions = _blend_trajectories(canceled_positions, positions)
+        canceled_positions = None
 
         # Conditionally upsample
         if use_upsample:
@@ -214,31 +323,39 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
 
         # send motor command
         base_time = time.time_ns() - step_interval_ns
+        last_sent_position = None
+        last_sent_time = None
 
-        for i_step, position in enumerate(loop_positions):
-            # Conditionally apply low-pass filter
-            if use_filter and lowpass is not None:
-                position = lowpass.step(position)
-
+        for i_step, raw_position in enumerate(loop_positions):
             next_base_time = base_time + step_interval_ns
             sleep_time = next_base_time - time.time_ns()
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time / 1e9)
-
             base_time = next_base_time
-            timestamp = time.time_ns()
 
             # If there is a new event, cancel the current event.
-            if not events.empty():
+            if not command_queue.empty():
+                break
+            if not action_queue.empty():
                 if use_upsample:
-                    consumed_time_s = i_step * step_interval_s
-                    consumed_raw_steps = int(consumed_time_s * dynamic_chunk_hz)
-                else:
-                    # If not upsampling, i_step corresponds directly to the original steps
-                    consumed_raw_steps = i_step
-                canceled_positions = positions[consumed_raw_steps:]
+                    canceled_positions = _remaining_policy_trajectory(
+                        upsampler,
+                        positions,
+                        last_sent_position,
+                        last_sent_time,
+                    )
+                elif last_sent_position is not None:
+                    canceled_positions = np.concatenate(
+                        [last_sent_position[None, :], positions[i_step:]]
+                    )
                 break
 
+            position = raw_position
+            # Conditionally apply low-pass filter
+            if use_filter and lowpass is not None:
+                position = lowpass.step(position)
+
+            timestamp = time.time_ns()
             offset = 0
             n_elements = 8  # 7 joints + 1 gripper
             if "right" in arms:
@@ -254,38 +371,52 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
             if right_position is not None:
                 node.send_output(
                     "move_position_right",
-                    pa.array([{"qpos": right_position}], type=QPOS_TYPE),
+                    _qpos_output(right_position),
                     {"timestamp": timestamp},
                 )
             if left_position is not None:
                 node.send_output(
                     "move_position_left",
-                    pa.array([{"qpos": left_position}], type=QPOS_TYPE),
+                    _qpos_output(left_position),
                     {"timestamp": timestamp},
                 )
 
+            last_sent_position = np.asarray(position, dtype=np.float32).copy()
+            last_sent_time = i_step * step_interval_s
 
-async def _main_dora(node, events, executor_task):
+
+async def _main_dora(node, action_queue, command_queue, executor_task):
     while True:
-        if node.is_empty():
-            await asyncio.sleep(0.1)
-            continue
-        event = node.next()
+        event = await asyncio.to_thread(node.next)
         if event["type"] != "INPUT":
             break
 
         # Main process
-        await events.put(event)
+        if event["id"] == "actions":
+            _put_latest(action_queue, event)
+        elif event["id"] == "command":
+            _put_latest(command_queue, event)
     executor_task.cancel()
 
 
 async def _main_async(arms, use_upsample, use_filter, control_hz):
     node = dora.Node()
-    events = asyncio.Queue()
+    action_queue = asyncio.Queue(maxsize=1)
+    command_queue = asyncio.Queue(maxsize=1)
     executor_task = asyncio.create_task(
-        _main_executor(node, events, arms, use_upsample, use_filter, control_hz)
+        _main_executor(
+            node,
+            action_queue,
+            command_queue,
+            arms,
+            use_upsample,
+            use_filter,
+            control_hz,
+        )
     )
-    dora_task = asyncio.create_task(_main_dora(node, events, executor_task))
+    dora_task = asyncio.create_task(
+        _main_dora(node, action_queue, command_queue, executor_task)
+    )
 
     try:
         await executor_task
