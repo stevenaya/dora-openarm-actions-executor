@@ -31,14 +31,20 @@ START_COMMANDS = {"start"}
 STOP_COMMANDS = {"stop", "success", "fail", "cancel", "quit", "intervene"}
 
 
-# PCHIP interpolation for upsampling
-class PchipUpsampler:
-    """Upsamples coarse trajectory chunks using PCHIP interpolation."""
+INTERPOLATION_METHODS = {"pchip", "hermite"}
 
-    def __init__(self, chunk_hz, horizon_sec):
+
+# Cubic Hermite interpolation for upsampling
+class TrajectoryUpsampler:
+    """Upsamples coarse trajectory chunks using cubic Hermite interpolation."""
+
+    def __init__(self, chunk_hz, horizon_sec, method="pchip"):
         """Initialize the upsampler with the chunk frequency and horizon."""
+        if method not in INTERPOLATION_METHODS:
+            raise ValueError(f"Unsupported interpolation method: {method}")
         self.chunk_hz = float(chunk_hz)
         self.horizon_sec = float(horizon_sec)
+        self.method = method
         self.dt_chunk = 1.0 / self.chunk_hz
         self.t_chunk = np.arange(0.0, self.horizon_sec + 1e-12, self.dt_chunk)
 
@@ -46,15 +52,31 @@ class PchipUpsampler:
     def _edge_slope(h0, h1, s0, s1):
         slope = ((2.0 * h0 + h1) * s0 - h0 * s1) / (h0 + h1)
         opposite_sign = np.sign(slope) != np.sign(s0)
-        too_steep = (np.sign(s0) != np.sign(s1)) & (
-            np.abs(slope) > 3.0 * np.abs(s0)
-        )
+        too_steep = (np.sign(s0) != np.sign(s1)) & (np.abs(slope) > 3.0 * np.abs(s0))
         slope[opposite_sign] = 0.0
         slope[~opposite_sign & too_steep] = 3.0 * s0[~opposite_sign & too_steep]
         return slope
 
     @staticmethod
-    def _compute_slopes(t, y):
+    def _compute_hermite_slopes(t, y):
+        secants = np.diff(y, axis=0) / np.diff(t)[:, None]
+        slopes = np.zeros_like(y)
+
+        if len(y) == 1:
+            return slopes
+
+        slopes[0] = secants[0]
+        slopes[-1] = secants[-1]
+        for i in range(1, len(y) - 1):
+            product = secants[i - 1] * secants[i]
+            mask = product <= 0.0
+            slope = 0.5 * (secants[i - 1] + secants[i])
+            slope[mask] = 0.0
+            slopes[i] = slope
+        return slopes
+
+    @staticmethod
+    def _compute_pchip_slopes(t, y):
         h = np.diff(t)
         secants = np.diff(y, axis=0) / h[:, None]
         slopes = np.zeros_like(y)
@@ -77,19 +99,28 @@ class PchipUpsampler:
         with np.errstate(divide="ignore", invalid="ignore"):
             interior = (w1 + w2) / (w1 / s_prev + w2 / s_next)
         slopes[1:-1] = np.where(same_sign, interior, 0.0)
-        slopes[0] = PchipUpsampler._edge_slope(h[0], h[1], secants[0], secants[1])
-        slopes[-1] = PchipUpsampler._edge_slope(
+        slopes[0] = TrajectoryUpsampler._edge_slope(h[0], h[1], secants[0], secants[1])
+        slopes[-1] = TrajectoryUpsampler._edge_slope(
             h[-1], h[-2], secants[-1], secants[-2]
         )
         return slopes
 
+    def _compute_slopes(self, t, y):
+        if self.method == "hermite":
+            return self._compute_hermite_slopes(t, y)
+        return self._compute_pchip_slopes(t, y)
+
     def upsample(self, y_chunk, t_eval):
         """Upsample the given chunk of trajectory to the specified evaluation times."""
         y = np.asarray(y_chunk, dtype=np.float64)
+        if y.shape[0] == 0:
+            raise ValueError("Cannot upsample an empty trajectory chunk")
         if y.shape[0] != len(self.t_chunk):
             raise ValueError(
                 f"Expected chunk length {len(self.t_chunk)}, got {y.shape[0]}"
             )
+        if y.shape[0] == 1:
+            return np.repeat(y, len(t_eval), axis=0).astype(np.float32)
 
         slopes = self._compute_slopes(self.t_chunk, y)
         idx = np.searchsorted(self.t_chunk, t_eval, side="right") - 1
@@ -175,7 +206,7 @@ class _ActionChunk:
 
 @dataclass
 class _ProcessorState:
-    upsampler: PchipUpsampler | None = None
+    upsampler: TrajectoryUpsampler | None = None
     lowpass: BiquadLowpass | None = None
     dynamic_chunk_hz: float | None = None
     target_interval_ns: int | None = None
@@ -197,21 +228,26 @@ def _parse_event(event):
     )
 
 
-def _build_or_validate_processors(chunk, state, use_upsample, use_filter, control_hz):
+def _build_or_validate_processors(
+    chunk, state, use_upsample, use_filter, control_hz, interpolation
+):
     if not use_upsample or state.upsampler is not None:
         return state
 
     state.dynamic_chunk_hz = 1e9 / chunk.interval_ns
-    horizon_sec = (len(chunk.positions) - 1) / state.dynamic_chunk_hz
+    raw_interval_s = 1.0 / state.dynamic_chunk_hz
+    horizon_sec = max(0, len(chunk.positions) - 1) / state.dynamic_chunk_hz
 
-    state.upsampler = PchipUpsampler(
+    state.upsampler = TrajectoryUpsampler(
         chunk_hz=state.dynamic_chunk_hz,
         horizon_sec=horizon_sec,
+        method=interpolation,
     )
 
     state.target_interval_s = 1.0 / float(control_hz)
     state.target_interval_ns = int(state.target_interval_s * 1e9)
-    state.t_eval = np.arange(0.0, horizon_sec + 1e-9, state.target_interval_s)
+    eval_horizon_sec = raw_interval_s if len(chunk.positions) == 1 else horizon_sec
+    state.t_eval = np.arange(0.0, eval_horizon_sec + 1e-9, state.target_interval_s)
 
     if use_filter:
         state.lowpass = BiquadLowpass(fs=control_hz, fc=chunk.cutoff_hz)
@@ -222,12 +258,74 @@ def _build_or_validate_processors(chunk, state, use_upsample, use_filter, contro
 def _blend_remaining(remaining_raw_positions, next_positions):
     if remaining_raw_positions is None:
         return next_positions
+    if len(remaining_raw_positions) == 0:
+        return next_positions
+    if len(next_positions) == 0:
+        return remaining_raw_positions
 
-    n = len(remaining_raw_positions)
+    n = min(len(remaining_raw_positions), len(next_positions))
+    if n < 2:
+        if len(next_positions) < 2:
+            return next_positions
+        anchored = next_positions.copy()
+        anchored[0] = remaining_raw_positions[0]
+        return anchored
+
+    old_positions = remaining_raw_positions[:n]
     overlapped_positions = next_positions[:n]
     weights = np.linspace(1, 0, n, dtype=np.float32).reshape(n, 1)
-    blended = remaining_raw_positions * weights + overlapped_positions * (1 - weights)
+    blended = old_positions * weights + overlapped_positions * (1 - weights)
     return np.concatenate([blended, next_positions[n:]])
+
+
+def _consumed_raw_steps(i_step, step_interval_s, dynamic_chunk_hz, n_positions):
+    consumed = int(np.floor(i_step * step_interval_s * dynamic_chunk_hz + 0.5))
+    return min(max(consumed, 0), n_positions)
+
+
+def _remaining_from_last_sent(
+    positions,
+    last_sent_position,
+    last_sent_step_index,
+    step_interval_s,
+    dynamic_chunk_hz,
+    use_upsample,
+    upsampler=None,
+):
+    if last_sent_position is None or last_sent_step_index is None:
+        return None
+
+    anchor = last_sent_position.reshape(1, -1).copy()
+    if len(positions) <= 1:
+        return anchor
+
+    if not use_upsample:
+        next_raw_index = last_sent_step_index + 1
+        next_raw_index = min(max(next_raw_index, 0), len(positions))
+        future_positions = positions[next_raw_index:]
+        if len(future_positions) == 0:
+            return anchor
+        return np.concatenate([anchor, future_positions])
+
+    if dynamic_chunk_hz is None or upsampler is None:
+        return anchor
+
+    raw_interval_s = 1.0 / float(dynamic_chunk_hz)
+    elapsed_s = last_sent_step_index * step_interval_s
+    horizon_s = (len(positions) - 1) * raw_interval_s
+    remaining_duration_s = horizon_s - elapsed_s
+    if remaining_duration_s <= 0.0:
+        return anchor
+
+    n_future = int(np.floor(remaining_duration_s / raw_interval_s + 1e-9))
+    if n_future <= 0:
+        return anchor
+
+    sample_times = elapsed_s + raw_interval_s * np.arange(
+        1, n_future + 1, dtype=np.float64
+    )
+    future_positions = upsampler.upsample(positions, sample_times)
+    return np.concatenate([anchor, future_positions])
 
 
 def _clear_queue(queue):
@@ -322,7 +420,14 @@ def _send_arm_outputs(node, right_position, left_position, timestamp):
 
 
 async def _main_executor(
-    node, action_queue, command_queue, arms, use_upsample, use_filter, control_hz
+    node,
+    action_queue,
+    command_queue,
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    interpolation,
 ):
     if not use_upsample and use_filter:
         print(
@@ -331,6 +436,8 @@ async def _main_executor(
         use_filter = False
 
     remaining_raw_positions = None
+    last_sent_position = None
+    last_sent_step_index = None
     processor_state = _ProcessorState()
     enabled = False
 
@@ -340,6 +447,8 @@ async def _main_executor(
             enabled, remaining_raw_positions, processor_state = _apply_command(
                 event, action_queue
             )
+            last_sent_position = None
+            last_sent_step_index = None
             continue
         if not enabled:
             continue
@@ -351,6 +460,7 @@ async def _main_executor(
             use_upsample,
             use_filter,
             control_hz,
+            interpolation,
         )
 
         positions = _blend_remaining(remaining_raw_positions, chunk.positions)
@@ -371,11 +481,7 @@ async def _main_executor(
         # send motor command
         base_time = time.monotonic_ns() - step_interval_ns
 
-        for i_step, position in enumerate(loop_positions):
-            # Conditionally apply low-pass filter
-            if use_filter and processor_state.lowpass is not None:
-                position = processor_state.lowpass.step(position)
-
+        for i_step, raw_position in enumerate(loop_positions):
             next_base_time = base_time + step_interval_ns
             sleep_time = next_base_time - time.monotonic_ns()
             if sleep_time > 0:
@@ -389,27 +495,55 @@ async def _main_executor(
                 enabled, remaining_raw_positions, processor_state = _apply_command(
                     event, action_queue
                 )
+                last_sent_position = None
+                last_sent_step_index = None
                 break
 
             # If there is a new event, cancel the current event.
             if not action_queue.empty():
-                if use_upsample:
-                    consumed_time_s = i_step * step_interval_s
-                    consumed_raw_steps = int(
-                        consumed_time_s * processor_state.dynamic_chunk_hz
-                    )
-                else:
-                    # If not upsampling, i_step corresponds directly to the original steps
-                    consumed_raw_steps = i_step
-                remaining_raw_positions = positions[consumed_raw_steps:]
+                remaining_raw_positions = _remaining_from_last_sent(
+                    positions,
+                    last_sent_position,
+                    last_sent_step_index,
+                    step_interval_s,
+                    processor_state.dynamic_chunk_hz,
+                    use_upsample,
+                    processor_state.upsampler,
+                )
+                if remaining_raw_positions is None:
+                    if use_upsample:
+                        consumed_raw_steps = _consumed_raw_steps(
+                            i_step,
+                            step_interval_s,
+                            processor_state.dynamic_chunk_hz,
+                            len(positions),
+                        )
+                    else:
+                        # If not upsampling, i_step corresponds directly to the original steps
+                        consumed_raw_steps = i_step
+                    remaining_raw_positions = positions[consumed_raw_steps:]
                 break
+
+            position = raw_position
+            # Conditionally apply low-pass filter.
+            if use_filter and processor_state.lowpass is not None:
+                position = processor_state.lowpass.step(position)
 
             right_position, left_position = _split_arm_positions(position, arms)
             _send_arm_outputs(node, right_position, left_position, timestamp)
+            last_sent_position = np.asarray(position, dtype=np.float32).copy()
+            last_sent_step_index = i_step
 
 
 def _put_latest(queue, event):
     _clear_queue(queue)
+    queue.put_nowait(event)
+
+
+def _put_bounded(queue, event):
+    if queue.maxsize > 0:
+        while queue.full():
+            queue.get_nowait()
     queue.put_nowait(event)
 
 
@@ -421,18 +555,34 @@ async def _main_dora(node, action_queue, command_queue, executor_task):
 
         event_id = event["id"]
         if event_id == "actions":
-            _put_latest(action_queue, event)
+            _put_bounded(action_queue, event)
         elif event_id == "command":
             _put_latest(command_queue, event)
     executor_task.cancel()
 
 
-async def _main_async(arms, use_upsample, use_filter, control_hz):
+async def _main_async(
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    action_queue_size,
+    interpolation,
+):
     node = dora.Node()
-    action_queue = asyncio.Queue(maxsize=1)
+    action_queue = asyncio.Queue(maxsize=action_queue_size)
     command_queue = asyncio.Queue(maxsize=1)
     executor_task = asyncio.create_task(
-        _main_executor(node, action_queue, command_queue, arms, use_upsample, use_filter, control_hz)
+        _main_executor(
+            node,
+            action_queue,
+            command_queue,
+            arms,
+            use_upsample,
+            use_filter,
+            control_hz,
+            interpolation,
+        )
     )
     dora_task = asyncio.create_task(_main_dora(node, action_queue, command_queue, executor_task))
 
@@ -468,8 +618,25 @@ def main():
         type=float,
         help="motor control frequency (Hz)",
     )
+    parser.add_argument(
+        "--interpolation",
+        default=os.getenv("ACTION_INTERPOLATION", "pchip"),
+        choices=sorted(INTERPOLATION_METHODS),
+        help=(
+            "Upsampling interpolation method: pchip (shape-preserving) or "
+            "hermite (original slope rule)."
+        ),
+    )
+    parser.add_argument(
+        "--action-queue-size",
+        default=int(os.getenv("ACTION_QUEUE_SIZE", "1")),
+        type=int,
+        help="Internal action event queue size. 1 keeps latest only; 0 is unbounded.",
+    )
 
     args = parser.parse_args()
+    if args.action_queue_size < 0:
+        raise ValueError("--action-queue-size must be >= 0")
     arms = args.arms.split(",")
 
     asyncio.run(
@@ -478,6 +645,8 @@ def main():
             use_upsample=args.upsample,
             use_filter=args.filter,
             control_hz=args.control_hz,
+            action_queue_size=args.action_queue_size,
+            interpolation=args.interpolation,
         )
     )
 
