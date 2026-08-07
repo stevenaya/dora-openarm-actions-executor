@@ -23,6 +23,9 @@ import pyarrow as pa
 import time
 
 
+QPOS_TYPE = pa.struct([("qpos", pa.list_(pa.float32()))])
+
+
 # Hermite cubic spline interpolation for upsampling
 class HermiteUpsampler:
     """Upsamples coarse trajectory chunks using cubic Hermite spline interpolation."""
@@ -249,37 +252,17 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
             else:
                 left_position = None
             if right_position is not None:
-                if left_position is None:
-                    node.send_output(
-                        "move_position_right",
-                        right_position,
-                        {"timestamp": timestamp},
-                    )
-                else:
-                    node.send_output(
-                        "move_position_right",
-                        pa.StructArray.from_arrays(
-                            [right_position, left_position],
-                            names=("new_position", "other_arm_position"),
-                        ),
-                        {"timestamp": timestamp},
-                    )
+                node.send_output(
+                    "move_position_right",
+                    pa.array([{"qpos": right_position}], type=QPOS_TYPE),
+                    {"timestamp": timestamp},
+                )
             if left_position is not None:
-                if right_position is None:
-                    node.send_output(
-                        "move_position_left",
-                        left_position,
-                        {"timestamp": timestamp},
-                    )
-                else:
-                    node.send_output(
-                        "move_position_left",
-                        pa.StructArray.from_arrays(
-                            [left_position, right_position],
-                            names=("new_position", "other_arm_position"),
-                        ),
-                        {"timestamp": timestamp},
-                    )
+                node.send_output(
+                    "move_position_left",
+                    pa.array([{"qpos": left_position}], type=QPOS_TYPE),
+                    {"timestamp": timestamp},
+                )
 
 
 async def _main_dora(node, events, executor_task):
