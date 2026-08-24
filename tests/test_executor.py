@@ -6,6 +6,7 @@ import asyncio
 
 import numpy as np
 import pyarrow as pa
+import pytest
 
 from dora_openarm_actions_executor.main import (
     QPOS_TYPE,
@@ -54,6 +55,22 @@ def test_blend_starts_at_previous_sent_position_and_ends_on_new_chunk():
     blended = _blend_trajectories(previous, current)
 
     np.testing.assert_allclose(blended, [[1.0], [11.0], [30.0], [40.0]])
+
+
+def test_blend_limits_transition_to_configured_steps():
+    previous = np.array([[1.0], [2.0], [3.0], [4.0]], dtype=np.float32)
+    current = np.array([[10.0], [20.0], [30.0], [40.0]], dtype=np.float32)
+
+    blended = _blend_trajectories(previous, current, max_steps=3)
+
+    np.testing.assert_allclose(blended, [[1.0], [11.0], [30.0], [40.0]])
+
+
+def test_blend_rejects_nonpositive_step_limit():
+    positions = np.array([[1.0], [2.0]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="must be positive"):
+        _blend_trajectories(positions, positions, max_steps=0)
 
 
 def test_lowpass_reset_starts_at_new_pose():

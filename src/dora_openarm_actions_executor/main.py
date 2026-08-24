@@ -28,6 +28,13 @@ START_COMMANDS = {"start"}
 STOP_COMMANDS = {"stop", "intervene", "quit"}
 
 
+def _positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
 # Hermite cubic spline interpolation for upsampling
 class HermiteUpsampler:
     """Upsamples coarse trajectory chunks using cubic Hermite spline interpolation."""
@@ -136,11 +143,15 @@ class BiquadLowpass:
         return y.astype(np.float32)
 
 
-def _blend_trajectories(previous, current):
+def _blend_trajectories(previous, current, max_steps=None):
+    if max_steps is not None and max_steps <= 0:
+        raise ValueError("max_steps must be positive")
     if previous is None or len(previous) == 0:
         return current
 
     count = min(len(previous), len(current))
+    if max_steps is not None:
+        count = min(count, max_steps)
     output = current.copy()
     weights = np.linspace(1.0, 0.0, count, dtype=np.float32)[:, None]
     output[:count] = previous[:count] * weights + current[:count] * (1.0 - weights)
@@ -237,12 +248,20 @@ async def _main_executor(
     use_upsample,
     use_filter,
     control_hz,
+    blend_max_steps,
 ):
     if not use_upsample and use_filter:
         print(
             "Warning: upsample is False, but filter is True. Forcing filter to False."
         )
         use_filter = False
+
+    blend_description = (
+        "full remaining trajectory"
+        if blend_max_steps is None
+        else f"{blend_max_steps} policy points"
+    )
+    print(f"actions-executor trajectory blend: {blend_description}", flush=True)
 
     enabled = False
     canceled_positions = None
@@ -308,7 +327,11 @@ async def _main_executor(
                 lowpass.reset_state(positions[0])
 
         # blend trajectory
-        positions = _blend_trajectories(canceled_positions, positions)
+        positions = _blend_trajectories(
+            canceled_positions,
+            positions,
+            max_steps=blend_max_steps,
+        )
         canceled_positions = None
 
         # Conditionally upsample
@@ -399,7 +422,13 @@ async def _main_dora(node, action_queue, command_queue, executor_task):
     executor_task.cancel()
 
 
-async def _main_async(arms, use_upsample, use_filter, control_hz):
+async def _main_async(
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    blend_max_steps,
+):
     node = dora.Node()
     action_queue = asyncio.Queue(maxsize=1)
     command_queue = asyncio.Queue(maxsize=1)
@@ -412,6 +441,7 @@ async def _main_async(arms, use_upsample, use_filter, control_hz):
             use_upsample,
             use_filter,
             control_hz,
+            blend_max_steps,
         )
     )
     dora_task = asyncio.create_task(
@@ -450,6 +480,12 @@ def main():
         type=float,
         help="motor control frequency (Hz)",
     )
+    parser.add_argument(
+        "--blend-max-steps",
+        default=os.getenv("ACTION_BLEND_MAX_STEPS"),
+        type=_positive_int,
+        help="maximum policy points used to blend a canceled trajectory into a new chunk",
+    )
 
     args = parser.parse_args()
     arms = args.arms.split(",")
@@ -460,6 +496,7 @@ def main():
             use_upsample=args.upsample,
             use_filter=args.filter,
             control_hz=args.control_hz,
+            blend_max_steps=args.blend_max_steps,
         )
     )
 
