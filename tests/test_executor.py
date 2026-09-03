@@ -52,18 +52,20 @@ def test_blend_starts_at_previous_sent_position_and_ends_on_new_chunk():
     previous = np.array([[1.0], [2.0], [3.0]], dtype=np.float32)
     current = np.array([[10.0], [20.0], [30.0], [40.0]], dtype=np.float32)
 
-    blended = _blend_trajectories(previous, current)
+    blended, count = _blend_trajectories(previous, current)
 
     np.testing.assert_allclose(blended, [[1.0], [11.0], [30.0], [40.0]])
+    assert count == 3
 
 
 def test_blend_limits_transition_to_configured_steps():
     previous = np.array([[1.0], [2.0], [3.0], [4.0]], dtype=np.float32)
     current = np.array([[10.0], [20.0], [30.0], [40.0]], dtype=np.float32)
 
-    blended = _blend_trajectories(previous, current, max_steps=3)
+    blended, count = _blend_trajectories(previous, current, max_steps=3)
 
     np.testing.assert_allclose(blended, [[1.0], [11.0], [30.0], [40.0]])
+    assert count == 3
 
 
 def test_blend_rejects_nonpositive_step_limit():

@@ -147,7 +147,7 @@ def _blend_trajectories(previous, current, max_steps=None):
     if max_steps is not None and max_steps <= 0:
         raise ValueError("max_steps must be positive")
     if previous is None or len(previous) == 0:
-        return current
+        return current, 0
 
     count = min(len(previous), len(current))
     if max_steps is not None:
@@ -155,7 +155,7 @@ def _blend_trajectories(previous, current, max_steps=None):
     output = current.copy()
     weights = np.linspace(1.0, 0.0, count, dtype=np.float32)[:, None]
     output[:count] = previous[:count] * weights + current[:count] * (1.0 - weights)
-    return output
+    return output, count
 
 
 def _remaining_policy_trajectory(
@@ -265,6 +265,7 @@ async def _main_executor(
 
     enabled = False
     canceled_positions = None
+    canceled_chunk_id = None
     upsampler = None
     lowpass = None
     dynamic_chunk_hz = None
@@ -279,6 +280,7 @@ async def _main_executor(
             if new_enabled is not None:
                 enabled = new_enabled
                 canceled_positions = None
+                canceled_chunk_id = None
                 upsampler = None
                 lowpass = None
                 dynamic_chunk_hz = None
@@ -290,6 +292,7 @@ async def _main_executor(
             continue
 
         interval = event["metadata"]["interval"]
+        chunk_id = event["metadata"].get("chunk_id")
         # Filter cutoff frequency is 15 Hz by default, which is a common choice for robotic arm control to balance smoothness and responsiveness.
         cutoff = event["metadata"].get("cutoff_hz", 15)
         n_positions = len(event["value"])
@@ -319,6 +322,7 @@ async def _main_executor(
         if reset:
             print("Resetting trajectory, discarding any previous trajectory.")
             canceled_positions = None
+            canceled_chunk_id = None
             # Also re-initialize the low-pass filter to the new episode's first
             # pose. Otherwise its retained state pulls the first samples toward
             # the previous episode's final pose, causing a jerk/ramp at start.
@@ -327,12 +331,14 @@ async def _main_executor(
                 lowpass.reset_state(positions[0])
 
         # blend trajectory
-        positions = _blend_trajectories(
+        blended_chunk_id = canceled_chunk_id
+        positions, blend_policy_points = _blend_trajectories(
             canceled_positions,
             positions,
             max_steps=blend_max_steps,
         )
         canceled_positions = None
+        canceled_chunk_id = None
 
         # Conditionally upsample
         if use_upsample:
@@ -371,6 +377,8 @@ async def _main_executor(
                     canceled_positions = np.concatenate(
                         [last_sent_position[None, :], positions[i_step:]]
                     )
+                if canceled_positions is not None:
+                    canceled_chunk_id = chunk_id
                 break
 
             position = raw_position
@@ -379,6 +387,23 @@ async def _main_executor(
                 position = lowpass.step(position)
 
             timestamp = time.time_ns()
+            output_metadata = {"timestamp": timestamp}
+            if chunk_id is not None:
+                output_metadata["chunk_id"] = chunk_id
+                output_metadata["blend_policy_points"] = blend_policy_points
+                received_timestamp = event["metadata"].get(
+                    "executor_received_timestamp_ns"
+                )
+                if received_timestamp is not None:
+                    output_metadata["executor_received_timestamp_ns"] = (
+                        received_timestamp
+                    )
+                blend_end_s = max(0, blend_policy_points - 1) * interval / 1e9
+                if (
+                    blended_chunk_id is not None
+                    and i_step * step_interval_s <= blend_end_s
+                ):
+                    output_metadata["blended_chunk_id"] = blended_chunk_id
             offset = 0
             n_elements = 8  # 7 joints + 1 gripper
             if "right" in arms:
@@ -395,13 +420,13 @@ async def _main_executor(
                 node.send_output(
                     "move_position_right",
                     _qpos_output(right_position),
-                    {"timestamp": timestamp},
+                    output_metadata,
                 )
             if left_position is not None:
                 node.send_output(
                     "move_position_left",
                     _qpos_output(left_position),
-                    {"timestamp": timestamp},
+                    output_metadata,
                 )
 
             last_sent_position = np.asarray(position, dtype=np.float32).copy()
@@ -416,6 +441,8 @@ async def _main_dora(node, action_queue, command_queue, executor_task):
 
         # Main process
         if event["id"] == "actions":
+            event["metadata"] = dict(event["metadata"])
+            event["metadata"]["executor_received_timestamp_ns"] = time.time_ns()
             _put_latest(action_queue, event)
         elif event["id"] == "command":
             _put_latest(command_queue, event)
