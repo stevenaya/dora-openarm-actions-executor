@@ -2,6 +2,10 @@
 
 A [Dora](https://dora-rs.ai/) node that executes timestamped actions for OpenArm.
 
+## Documentation
+
+- [Trajectory execution, handoff, and provenance](docs/trajectory-execution.md)
+
 ## License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
