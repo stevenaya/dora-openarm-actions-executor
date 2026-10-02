@@ -20,77 +20,46 @@ import dora
 import os
 import numpy as np
 import pyarrow as pa
+from scipy.interpolate import PchipInterpolator
 import time
 
 
 QPOS_TYPE = pa.struct([("qpos", pa.list_(pa.float32()))])
+START_COMMANDS = {"start"}
+STOP_COMMANDS = {"stop", "intervene", "quit"}
 
 
-# Hermite cubic spline interpolation for upsampling
-class HermiteUpsampler:
-    """Upsamples coarse trajectory chunks using cubic Hermite spline interpolation."""
+def _nonnegative_float(value):
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
+    return parsed
 
-    def __init__(self, chunk_hz, horizon_sec):
-        """Initialize the upsampler with the chunk frequency and horizon."""
-        self.chunk_hz = float(chunk_hz)
-        self.horizon_sec = float(horizon_sec)
-        self.dt_chunk = 1.0 / self.chunk_hz
-        self.t_chunk = np.arange(0.0, self.horizon_sec + 1e-12, self.dt_chunk)
 
-    @staticmethod
-    def _compute_slopes(t, y):
-        s = np.diff(y, axis=0) / np.diff(t)[:, None]
-        m = np.zeros_like(y)
-        m[0] = s[0]
-        m[-1] = s[-1]
-        for i in range(1, len(y) - 1):
-            prod = s[i - 1] * s[i]
-            mask = prod <= 0.0
-            mi = 0.5 * (s[i - 1] + s[i])
-            mi[mask] = 0.0
-            m[i] = mi
-        return m
-
-    def upsample(self, y_chunk, t_eval):
-        """Upsample the given chunk of trajectory to the specified evaluation times."""
-        y = np.asarray(y_chunk, dtype=np.float32)
-        if y.shape[0] != len(self.t_chunk):
-            raise ValueError(
-                f"Expected chunk length {len(self.t_chunk)}, got {y.shape[0]}"
-            )
-
-        slopes = self._compute_slopes(self.t_chunk, y)
-        idx = np.searchsorted(self.t_chunk, t_eval, side="right") - 1
-        idx = np.clip(idx, 0, len(self.t_chunk) - 2)
-
-        t0 = self.t_chunk[idx]
-        t1 = self.t_chunk[idx + 1]
-        h = t1 - t0
-        u = (t_eval - t0) / h
-
-        h00 = 2 * u**3 - 3 * u**2 + 1
-        h10 = (u**3 - 2 * u**2 + u) * h
-        h01 = -2 * u**3 + 3 * u**2
-        h11 = (u**3 - u**2) * h
-
-        y0 = y[idx]
-        y1 = y[idx + 1]
-        m0 = slopes[idx]
-        m1 = slopes[idx + 1]
-
-        return (
-            h00[:, None] * y0
-            + h10[:, None] * m0
-            + h01[:, None] * y1
-            + h11[:, None] * m1
-        ).astype(np.float32)
+def _upsample_trajectory(positions, interval_ns, step_interval_ns):
+    """Use shape-preserving PCHIP on a fixed grid that includes the final pose."""
+    positions = np.asarray(positions, dtype=np.float32)
+    if len(positions) == 1:
+        return positions
+    knot_ns = np.arange(len(positions), dtype=np.int64) * interval_ns
+    horizon_ns = knot_ns[-1]
+    steps = (horizon_ns + step_interval_ns - 1) // step_interval_ns
+    sample_ns = np.arange(steps + 1, dtype=np.int64) * step_interval_ns
+    # Keep the command period fixed; sample past the horizon holds the final pose.
+    sample_ns = np.minimum(sample_ns, horizon_ns)
+    interpolator = PchipInterpolator(
+        knot_ns / 1e9, positions, axis=0, extrapolate=False
+    )
+    output = interpolator(sample_ns / 1e9).astype(np.float32)
+    output[-1] = positions[-1]
+    return output
 
 
 # Tustin bilinear transform based biquad low-pass filter
 class BiquadLowpass:
     """Biquad low-pass filter for smoothing outputs."""
 
-    def __init__(self, fs, fc, Q=0.707):
+    def __init__(self, fs, fc, Q=0.5):
         """Initialize the biquad low-pass filter with sampling frequency, cutoff frequency, and Q factor."""
         fs = float(fs)
         fc = float(fc)
@@ -134,32 +103,123 @@ class BiquadLowpass:
         return y.astype(np.float32)
 
 
-async def _main_executor(node, events, arms, use_upsample, use_filter, control_hz):
-    def blend(canceled_positions, next_positions):
-        n = len(canceled_positions)
-        overlapped_positions = next_positions[:n]
-        weights = np.linspace(1, 0, n, dtype=np.float32).reshape(n, 1)
-        blended = canceled_positions * weights + overlapped_positions * (1 - weights)
-        return blended, n
+def _blend_trajectories(previous, current, step_interval_ns, duration_ns=None):
+    if previous is None or len(previous) == 0 or duration_ns == 0:
+        return current, 0
 
+    count = min(len(previous), len(current))
+    if duration_ns is not None:
+        steps = (duration_ns + step_interval_ns - 1) // step_interval_ns
+        count = min(count, steps + 1)
+    output = current.copy()
+    weights = np.linspace(1.0, 0.0, count, dtype=np.float32)[:, None]
+    output[:count] = previous[:count] * weights + current[:count] * (1.0 - weights)
+    return output, count
+
+
+def _clear_queue(queue):
+    while not queue.empty():
+        queue.get_nowait()
+
+
+def _put_latest(queue, event):
+    _clear_queue(queue)
+    queue.put_nowait(event)
+
+
+async def _next_input(action_queue, command_queue):
+    if not command_queue.empty():
+        return "command", command_queue.get_nowait()
+    if not action_queue.empty():
+        return "actions", action_queue.get_nowait()
+
+    action_task = asyncio.create_task(action_queue.get())
+    command_task = asyncio.create_task(command_queue.get())
+    done, pending = await asyncio.wait(
+        {action_task, command_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    if command_task in done:
+        if action_task in done:
+            action_task.result()
+        return "command", command_task.result()
+    return "actions", action_task.result()
+
+
+def _apply_command(event, action_queue):
+    command = event["value"][0].as_py()
+    if command in START_COMMANDS:
+        enabled = True
+    elif command in STOP_COMMANDS:
+        enabled = False
+    else:
+        return None
+
+    _clear_queue(action_queue)
+    print(
+        f"actions-executor command={command}: reset state, enabled={enabled}",
+        flush=True,
+    )
+    return enabled
+
+
+def _qpos_output(position):
+    return pa.array(
+        [{"qpos": np.asarray(position, dtype=np.float32)}],
+        type=QPOS_TYPE,
+    )
+
+
+async def _main_executor(
+    node,
+    action_queue,
+    command_queue,
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    blend_duration_ms,
+):
     if not use_upsample and use_filter:
         print(
             "Warning: upsample is False, but filter is True. Forcing filter to False."
         )
         use_filter = False
 
-    canceled_positions = None
+    blend_description = (
+        "full remaining trajectory"
+        if blend_duration_ms is None
+        else f"{blend_duration_ms:g} ms"
+    )
+    print(f"actions-executor trajectory blend: {blend_description}", flush=True)
+    duration_ns = (
+        None if blend_duration_ms is None else int(round(blend_duration_ms * 1e6))
+    )
 
-    upsampler = None
+    enabled = False
+    canceled_positions = None
+    canceled_chunk_id = None
     lowpass = None
-    dynamic_chunk_hz = None
-    target_interval_ns = None
-    target_interval_s = None
-    t_eval = None
 
     while True:
-        event = await events.get()
+        event_id, event = await _next_input(action_queue, command_queue)
+        if event_id == "command":
+            new_enabled = _apply_command(event, action_queue)
+            if new_enabled is not None:
+                enabled = new_enabled
+                canceled_positions = None
+                canceled_chunk_id = None
+                lowpass = None
+            continue
+        if not enabled:
+            continue
+
         interval = event["metadata"]["interval"]
+        chunk_id = event["metadata"].get("chunk_id")
         # Filter cutoff frequency is 15 Hz by default, which is a common choice for robotic arm control to balance smoothness and responsiveness.
         cutoff = event["metadata"].get("cutoff_hz", 15)
         n_positions = len(event["value"])
@@ -167,78 +227,80 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
         reset = event["metadata"].get("reset", False)
         positions = event["value"].values.to_numpy().reshape(n_positions, pos_shape)
 
-        # Initialize upsampler and low-pass filter if needed
-        if use_upsample and upsampler is None:
-            dynamic_chunk_hz = 1e9 / interval
-            horizon_sec = (n_positions - 1) / dynamic_chunk_hz
+        # Build each new chunk on the execution grid before mixing trajectories.
+        if use_upsample:
+            step_interval_ns = int(1e9 / control_hz)
+            loop_positions = _upsample_trajectory(positions, interval, step_interval_ns)
 
-            upsampler = HermiteUpsampler(
-                chunk_hz=dynamic_chunk_hz, horizon_sec=horizon_sec
-            )
-
-            target_interval_s = 1.0 / float(control_hz)
-            target_interval_ns = int(target_interval_s * 1e9)
-
-            t_eval = np.arange(0.0, horizon_sec + 1e-9, target_interval_s)
-
-            if use_filter:
+            if use_filter and lowpass is None:
                 lowpass = BiquadLowpass(fs=control_hz, fc=cutoff)
+        else:
+            loop_positions = positions
+            step_interval_ns = interval
 
         # On a reset, these actions are the first of a new episode, so drop any
         # trajectory carried over from the previous one instead of blending it.
         if reset:
             print("Resetting trajectory, discarding any previous trajectory.")
             canceled_positions = None
-            # Also re-initialize the low-pass filter to the new episode's first
-            # pose. Otherwise its retained state pulls the first samples toward
-            # the previous episode's final pose, causing a jerk/ramp at start.
-            # positions[0] equals the first upsampled sample (Hermite at t=0).
+            canceled_chunk_id = None
             if lowpass is not None:
-                lowpass.reset_state(positions[0])
+                lowpass.reset_state(loop_positions[0])
 
-        # blend trajectory
-        if canceled_positions is not None:
-            blended, n = blend(canceled_positions, positions)
-            positions = np.concatenate([blended, positions[n:]])
-            canceled_positions = None
-
-        # Conditionally upsample
-        if use_upsample:
-            loop_positions = upsampler.upsample(positions, t_eval)
-            step_interval_ns = target_interval_ns
-            step_interval_s = target_interval_s
-        else:
-            loop_positions = positions
-            step_interval_ns = interval
-            step_interval_s = interval / 1e9
+        # The old buffer contains only unsent, not-yet-filtered control points.
+        blended_chunk_id = canceled_chunk_id
+        loop_positions, blend_steps = _blend_trajectories(
+            canceled_positions,
+            loop_positions,
+            step_interval_ns,
+            duration_ns,
+        )
+        blend_duration_ns = max(0, blend_steps - 1) * step_interval_ns
+        # Retain the existing recorder field as a rounded policy-span equivalent.
+        blend_policy_points = (
+            1 + (blend_duration_ns + interval - 1) // interval if blend_steps else 0
+        )
+        canceled_positions = None
+        canceled_chunk_id = None
 
         # send motor command
         base_time = time.time_ns() - step_interval_ns
 
-        for i_step, position in enumerate(loop_positions):
-            # Conditionally apply low-pass filter
-            if use_filter and lowpass is not None:
-                position = lowpass.step(position)
-
+        for i_step, raw_position in enumerate(loop_positions):
             next_base_time = base_time + step_interval_ns
             sleep_time = next_base_time - time.time_ns()
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time / 1e9)
-
             base_time = next_base_time
-            timestamp = time.time_ns()
 
             # If there is a new event, cancel the current event.
-            if not events.empty():
-                if use_upsample:
-                    consumed_time_s = i_step * step_interval_s
-                    consumed_raw_steps = int(consumed_time_s * dynamic_chunk_hz)
-                else:
-                    # If not upsampling, i_step corresponds directly to the original steps
-                    consumed_raw_steps = i_step
-                canceled_positions = positions[consumed_raw_steps:]
+            if not command_queue.empty():
+                break
+            if not action_queue.empty():
+                canceled_positions = loop_positions[i_step:]
+                canceled_chunk_id = chunk_id
                 break
 
+            position = raw_position
+            # Conditionally apply low-pass filter
+            if use_filter and lowpass is not None:
+                position = lowpass.step(position)
+
+            timestamp = time.time_ns()
+            output_metadata = {"timestamp": timestamp}
+            if chunk_id is not None:
+                output_metadata["chunk_id"] = chunk_id
+                output_metadata["blend_policy_points"] = blend_policy_points
+                output_metadata["blend_duration_ns"] = blend_duration_ns
+                received_timestamp = event["metadata"].get(
+                    "executor_received_timestamp_ns"
+                )
+                if received_timestamp is not None:
+                    output_metadata["executor_received_timestamp_ns"] = (
+                        received_timestamp
+                    )
+                if blended_chunk_id is not None and i_step < blend_steps:
+                    output_metadata["blended_chunk_id"] = blended_chunk_id
             offset = 0
             n_elements = 8  # 7 joints + 1 gripper
             if "right" in arms:
@@ -254,38 +316,58 @@ async def _main_executor(node, events, arms, use_upsample, use_filter, control_h
             if right_position is not None:
                 node.send_output(
                     "move_position_right",
-                    pa.array([{"qpos": right_position}], type=QPOS_TYPE),
-                    {"timestamp": timestamp},
+                    _qpos_output(right_position),
+                    output_metadata,
                 )
             if left_position is not None:
                 node.send_output(
                     "move_position_left",
-                    pa.array([{"qpos": left_position}], type=QPOS_TYPE),
-                    {"timestamp": timestamp},
+                    _qpos_output(left_position),
+                    output_metadata,
                 )
 
 
-async def _main_dora(node, events, executor_task):
+async def _main_dora(node, action_queue, command_queue, executor_task):
     while True:
-        if node.is_empty():
-            await asyncio.sleep(0.1)
-            continue
-        event = node.next()
+        event = await asyncio.to_thread(node.next)
         if event["type"] != "INPUT":
             break
 
         # Main process
-        await events.put(event)
+        if event["id"] == "actions":
+            event["metadata"] = dict(event["metadata"])
+            event["metadata"]["executor_received_timestamp_ns"] = time.time_ns()
+            _put_latest(action_queue, event)
+        elif event["id"] == "command":
+            _put_latest(command_queue, event)
     executor_task.cancel()
 
 
-async def _main_async(arms, use_upsample, use_filter, control_hz):
+async def _main_async(
+    arms,
+    use_upsample,
+    use_filter,
+    control_hz,
+    blend_duration_ms,
+):
     node = dora.Node()
-    events = asyncio.Queue()
+    action_queue = asyncio.Queue(maxsize=1)
+    command_queue = asyncio.Queue(maxsize=1)
     executor_task = asyncio.create_task(
-        _main_executor(node, events, arms, use_upsample, use_filter, control_hz)
+        _main_executor(
+            node,
+            action_queue,
+            command_queue,
+            arms,
+            use_upsample,
+            use_filter,
+            control_hz,
+            blend_duration_ms,
+        )
     )
-    dora_task = asyncio.create_task(_main_dora(node, events, executor_task))
+    dora_task = asyncio.create_task(
+        _main_dora(node, action_queue, command_queue, executor_task)
+    )
 
     try:
         await executor_task
@@ -306,7 +388,7 @@ def main():
     parser.add_argument(
         "--upsample",
         action="store_true",
-        help="Whether to upsample the actions",
+        help="Whether to upsample the actions using shape-preserving PCHIP",
     )
     parser.add_argument(
         "--filter",
@@ -319,6 +401,12 @@ def main():
         type=float,
         help="motor control frequency (Hz)",
     )
+    parser.add_argument(
+        "--blend-duration-ms",
+        default=os.getenv("ACTION_BLEND_DURATION_MS"),
+        type=_nonnegative_float,
+        help="handoff duration in milliseconds (unset: full overlap; 0: no blend)",
+    )
 
     args = parser.parse_args()
     arms = args.arms.split(",")
@@ -329,6 +417,7 @@ def main():
             use_upsample=args.upsample,
             use_filter=args.filter,
             control_hz=args.control_hz,
+            blend_duration_ms=args.blend_duration_ms,
         )
     )
 
