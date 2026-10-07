@@ -2,8 +2,8 @@
 
 # ruff: noqa: D103
 
-import asyncio
 import argparse
+import asyncio
 
 import numpy as np
 import pyarrow as pa
@@ -12,13 +12,15 @@ import pytest
 from dora_openarm_actions_executor.main import (
     QPOS_TYPE,
     BiquadLowpass,
-    _upsample_trajectory,
     _apply_command,
-    _blend_trajectories,
     _next_input,
+    _nonnegative_float,
     _put_latest,
     _qpos_output,
-    _nonnegative_float,
+)
+from dora_openarm_actions_executor.trajectory import (
+    _blend_trajectories,
+    _upsample_trajectory,
 )
 
 

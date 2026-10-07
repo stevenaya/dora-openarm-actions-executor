@@ -16,13 +16,16 @@
 
 import argparse
 import asyncio
-import dora
+from collections import deque
 import os
-import numpy as np
-import pyarrow as pa
-from scipy.interpolate import PchipInterpolator
 import time
 
+import dora
+import numpy as np
+import pyarrow as pa
+from scipy.signal import sosfiltfilt
+
+from dora_openarm_actions_executor.trajectory import Chunk, TrajectoryScheduler
 
 QPOS_TYPE = pa.struct([("qpos", pa.list_(pa.float32()))])
 START_COMMANDS = {"start"}
@@ -34,25 +37,6 @@ def _nonnegative_float(value):
     if not np.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError("must be finite and non-negative")
     return parsed
-
-
-def _upsample_trajectory(positions, interval_ns, step_interval_ns):
-    """Use shape-preserving PCHIP on a fixed grid that includes the final pose."""
-    positions = np.asarray(positions, dtype=np.float32)
-    if len(positions) == 1:
-        return positions
-    knot_ns = np.arange(len(positions), dtype=np.int64) * interval_ns
-    horizon_ns = knot_ns[-1]
-    steps = (horizon_ns + step_interval_ns - 1) // step_interval_ns
-    sample_ns = np.arange(steps + 1, dtype=np.int64) * step_interval_ns
-    # Keep the command period fixed; sample past the horizon holds the final pose.
-    sample_ns = np.minimum(sample_ns, horizon_ns)
-    interpolator = PchipInterpolator(
-        knot_ns / 1e9, positions, axis=0, extrapolate=False
-    )
-    output = interpolator(sample_ns / 1e9).astype(np.float32)
-    output[-1] = positions[-1]
-    return output
 
 
 # Tustin bilinear transform based biquad low-pass filter
@@ -103,20 +87,6 @@ class BiquadLowpass:
         return y.astype(np.float32)
 
 
-def _blend_trajectories(previous, current, step_interval_ns, duration_ns=None):
-    if previous is None or len(previous) == 0 or duration_ns == 0:
-        return current, 0
-
-    count = min(len(previous), len(current))
-    if duration_ns is not None:
-        steps = (duration_ns + step_interval_ns - 1) // step_interval_ns
-        count = min(count, steps + 1)
-    output = current.copy()
-    weights = np.linspace(1.0, 0.0, count, dtype=np.float32)[:, None]
-    output[:count] = previous[:count] * weights + current[:count] * (1.0 - weights)
-    return output, count
-
-
 def _clear_queue(queue):
     while not queue.empty():
         queue.get_nowait()
@@ -135,13 +105,16 @@ async def _next_input(action_queue, command_queue):
 
     action_task = asyncio.create_task(action_queue.get())
     command_task = asyncio.create_task(command_queue.get())
-    done, pending = await asyncio.wait(
-        {action_task, command_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        done, _ = await asyncio.wait(
+            {action_task, command_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in (action_task, command_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(action_task, command_task, return_exceptions=True)
 
     if command_task in done:
         if action_task in done:
@@ -174,6 +147,14 @@ def _qpos_output(position):
     )
 
 
+def _zero_phase_commands(positions, lowpass, history):
+    """Filter known future points with raw past context, never feeding outputs back."""
+    context = np.concatenate((np.asarray(history), positions)) if history else positions
+    sos = [[lowpass.b0, lowpass.b1, lowpass.b2, 1.0, lowpass.a1, lowpass.a2]]
+    filtered = sosfiltfilt(sos, context, axis=0, padlen=min(9, len(context) - 1))
+    return filtered[len(history):].astype(np.float32)
+
+
 async def _main_executor(
     node,
     action_queue,
@@ -183,148 +164,164 @@ async def _main_executor(
     use_filter,
     control_hz,
     blend_duration_ms,
+    mode="blend",
+    filter_mode="causal",
 ):
     if not use_upsample and use_filter:
-        print(
-            "Warning: upsample is False, but filter is True. Forcing filter to False."
-        )
+        print("Warning: filter requires upsample; disabling filter.", flush=True)
         use_filter = False
-
-    blend_description = (
-        "full remaining trajectory"
-        if blend_duration_ms is None
-        else f"{blend_duration_ms:g} ms"
+    print(
+        f"actions-executor mode={mode}, blend_duration_ms={blend_duration_ms}, "
+        f"filter={filter_mode if use_filter else 'off'}",
+        flush=True,
     )
-    print(f"actions-executor trajectory blend: {blend_description}", flush=True)
-    duration_ns = (
-        None if blend_duration_ms is None else int(round(blend_duration_ms * 1e6))
-    )
-
+    duration_ns = None if blend_duration_ms is None else round(blend_duration_ms * 1e6)
+    control_interval = int(1e9 / control_hz)
+    scheduler = TrajectoryScheduler()
     enabled = False
-    canceled_positions = None
-    canceled_chunk_id = None
-    lowpass = None
+    lowpass = plan = None
+    filter_history = filtered_positions = None
+    publish_plan = False
+
+    def send_plan(value):
+        metadata = (
+            {}
+            if scheduler.attempt_id is None
+            else {"episode_attempt_id": scheduler.attempt_id}
+        )
+        node.send_output("execution_plan", pa.array([value]), metadata)
+
+    def feedback(metadata):
+        # A rejection still acknowledges the sample, even with no adopted plan yet.
+        nonlocal plan
+        value = dict(plan) if plan is not None else {"chunk_id": "", "positions": []}
+        value["sample_chunk_id"] = metadata.get("chunk_id")
+        for source, target in (
+            ("executor_received_timestamp_ns", "received_timestamp_ns"),
+            ("inference_started_timestamp_ns", "inference_started_timestamp_ns"),
+        ):
+            value.pop(target, None)
+            if source in metadata:
+                value[target] = metadata[source]
+        send_plan(value)
+        if plan is not None:
+            plan = value
+
+    def reject(chunk, reason):
+        print(f"Dropped chunk={chunk.metadata.get('chunk_id')}: {reason}", flush=True)
+        if reason != "episode changed" and "based_on_chunk_id" in chunk.metadata:
+            feedback(chunk.metadata)
 
     while True:
-        event_id, event = await _next_input(action_queue, command_queue)
-        if event_id == "command":
-            new_enabled = _apply_command(event, action_queue)
-            if new_enabled is not None:
-                enabled = new_enabled
-                canceled_positions = None
-                canceled_chunk_id = None
-                lowpass = None
-            continue
-        if not enabled:
-            continue
+        if (
+            not command_queue.empty()
+            or not action_queue.empty()
+            or (scheduler.pending is None and scheduler.next_timestamp_ns is None)
+        ):
+            event_id, event = await _next_input(action_queue, command_queue)
+            if event_id == "command":
+                new_enabled = _apply_command(event, action_queue)
+                if new_enabled is not None:
+                    enabled = new_enabled
+                    scheduler.clear(event.get("metadata", {}))
+                    lowpass = None
+                    filter_history = filtered_positions = None
+                    if plan is not None:
+                        send_plan(None)
+                    plan = None
+                    publish_plan = False
+                continue
+            if not enabled:
+                continue
+            chunk = Chunk.from_event(event)
+            reason = scheduler.submit(chunk)
+            if reason:
+                reject(chunk, reason)
 
-        interval = event["metadata"]["interval"]
-        chunk_id = event["metadata"].get("chunk_id")
-        # Filter cutoff frequency is 15 Hz by default, which is a common choice for robotic arm control to balance smoothness and responsiveness.
-        cutoff = event["metadata"].get("cutoff_hz", 15)
-        n_positions = len(event["value"])
-        pos_shape = len(event["value"][0])
-        reset = event["metadata"].get("reset", False)
-        positions = event["value"].values.to_numpy().reshape(n_positions, pos_shape)
-
-        # Build each new chunk on the execution grid before mixing trajectories.
-        if use_upsample:
-            step_interval_ns = int(1e9 / control_hz)
-            loop_positions = _upsample_trajectory(positions, interval, step_interval_ns)
-
+        now_ns = time.time_ns()
+        chunk, reason = scheduler.take(now_ns)
+        if reason:
+            reject(chunk, reason)
+        elif chunk is not None:
+            step_ns = control_interval if use_upsample else chunk.interval_ns
+            scheduler.adopt(chunk, now_ns, step_ns, mode, duration_ns, use_upsample)
             if use_filter and lowpass is None:
-                lowpass = BiquadLowpass(fs=control_hz, fc=cutoff)
-        else:
-            loop_positions = positions
-            step_interval_ns = interval
-
-        # On a reset, these actions are the first of a new episode, so drop any
-        # trajectory carried over from the previous one instead of blending it.
-        if reset:
-            print("Resetting trajectory, discarding any previous trajectory.")
-            canceled_positions = None
-            canceled_chunk_id = None
-            if lowpass is not None:
-                lowpass.reset_state(loop_positions[0])
-
-        # The old buffer contains only unsent, not-yet-filtered control points.
-        blended_chunk_id = canceled_chunk_id
-        loop_positions, blend_steps = _blend_trajectories(
-            canceled_positions,
-            loop_positions,
-            step_interval_ns,
-            duration_ns,
-        )
-        blend_duration_ns = max(0, blend_steps - 1) * step_interval_ns
-        # Retain the existing recorder field as a rounded policy-span equivalent.
-        blend_policy_points = (
-            1 + (blend_duration_ns + interval - 1) // interval if blend_steps else 0
-        )
-        canceled_positions = None
-        canceled_chunk_id = None
-
-        # send motor command
-        base_time = time.time_ns() - step_interval_ns
-
-        for i_step, raw_position in enumerate(loop_positions):
-            next_base_time = base_time + step_interval_ns
-            sleep_time = next_base_time - time.time_ns()
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time / 1e9)
-            base_time = next_base_time
-
-            # If there is a new event, cancel the current event.
-            if not command_queue.empty():
-                break
-            if not action_queue.empty():
-                canceled_positions = loop_positions[i_step:]
-                canceled_chunk_id = chunk_id
-                break
-
-            position = raw_position
-            # Conditionally apply low-pass filter
-            if use_filter and lowpass is not None:
-                position = lowpass.step(position)
-
-            timestamp = time.time_ns()
-            output_metadata = {"timestamp": timestamp}
+                cutoff = chunk.metadata.get("cutoff_hz", 15)
+                lowpass = BiquadLowpass(
+                    fs=control_hz, fc=cutoff
+                )
+                filter_history = deque(maxlen=max(9, int(3 * control_hz / cutoff)))
+            if chunk.metadata.get("reset") and lowpass is not None:
+                lowpass.reset_state(scheduler.active.positions[0])
+                filter_history.clear()
+            if lowpass is not None and filter_mode == "zero-phase":
+                filtered_positions = _zero_phase_commands(
+                    scheduler.active.positions, lowpass, filter_history
+                )
+            publish_plan = plan is not None or "based_on_chunk_id" in chunk.metadata
+            command_metadata = {}
+            chunk_id = chunk.metadata.get("chunk_id")
             if chunk_id is not None:
-                output_metadata["chunk_id"] = chunk_id
-                output_metadata["blend_policy_points"] = blend_policy_points
-                output_metadata["blend_duration_ns"] = blend_duration_ns
-                received_timestamp = event["metadata"].get(
-                    "executor_received_timestamp_ns"
+                blend_ns = max(0, scheduler.blend_steps - 1) * step_ns
+                policy_interval = chunk.metadata["interval"]
+                command_metadata.update(
+                    chunk_id=chunk_id,
+                    blend_duration_ns=blend_ns,
+                    blend_policy_points=(
+                        1 + (blend_ns + policy_interval - 1) // policy_interval
+                        if scheduler.blend_steps
+                        else 0
+                    ),
                 )
-                if received_timestamp is not None:
-                    output_metadata["executor_received_timestamp_ns"] = (
-                        received_timestamp
-                    )
-                if blended_chunk_id is not None and i_step < blend_steps:
-                    output_metadata["blended_chunk_id"] = blended_chunk_id
+                if "executor_received_timestamp_ns" in chunk.metadata:
+                    command_metadata["executor_received_timestamp_ns"] = chunk.metadata[
+                        "executor_received_timestamp_ns"
+                    ]
+
+        next_ns = scheduler.next_timestamp_ns
+        if next_ns is not None and now_ns >= next_ns:
+            active, i_step = scheduler.active, scheduler.cursor
+            if i_step == 0 and publish_plan:
+                plan = {
+                    "chunk_id": active.metadata.get("chunk_id", ""),
+                    "start_timestamp_ns": active.start_ns,
+                    "interval_ns": active.interval_ns,
+                    # RTC consumes pre-filter targets; filtering the prior again causes drift.
+                    "positions": active.positions.tolist(),
+                }
+                feedback(active.metadata)
+            position = active.positions[i_step]
+            if lowpass is not None:
+                if filter_mode == "zero-phase":
+                    filter_history.append(position.copy())
+                    position = filtered_positions[i_step]
+                else:
+                    position = lowpass.step(position)
+            output_metadata = {**command_metadata, "timestamp": time.time_ns()}
+            if (
+                scheduler.blended_chunk_id is not None
+                and i_step < scheduler.blend_steps
+            ):
+                output_metadata["blended_chunk_id"] = scheduler.blended_chunk_id
             offset = 0
-            n_elements = 8  # 7 joints + 1 gripper
-            if "right" in arms:
-                right_position = position[offset : offset + n_elements]
-                offset += n_elements
-            else:
-                right_position = None
-            if "left" in arms:
-                left_position = position[offset : offset + n_elements]
-                offset += n_elements
-            else:
-                left_position = None
-            if right_position is not None:
-                node.send_output(
-                    "move_position_right",
-                    _qpos_output(right_position),
-                    output_metadata,
-                )
-            if left_position is not None:
-                node.send_output(
-                    "move_position_left",
-                    _qpos_output(left_position),
-                    output_metadata,
-                )
+            for arm in ("right", "left"):
+                if arm in arms:
+                    node.send_output(
+                        f"move_position_{arm}",
+                        _qpos_output(position[offset : offset + 8]),
+                        output_metadata,
+                    )
+                    offset += 8
+            scheduler.cursor += 1
+
+        deadlines = []
+        if scheduler.next_timestamp_ns is not None:
+            deadlines.append(scheduler.next_timestamp_ns)
+        if scheduler.pending is not None:
+            deadlines.append(scheduler.pending.takeover_ns)
+        if deadlines:
+            delay_ns = max(0, min(deadlines) - time.time_ns())
+            await asyncio.sleep(min(delay_ns, control_interval) / 1e9)
 
 
 async def _main_dora(node, action_queue, command_queue, executor_task):
@@ -349,6 +346,8 @@ async def _main_async(
     use_filter,
     control_hz,
     blend_duration_ms,
+    mode="blend",
+    filter_mode="causal",
 ):
     node = dora.Node()
     action_queue = asyncio.Queue(maxsize=1)
@@ -363,6 +362,8 @@ async def _main_async(
             use_filter,
             control_hz,
             blend_duration_ms,
+            mode,
+            filter_mode,
         )
     )
     dora_task = asyncio.create_task(
@@ -396,6 +397,12 @@ def main():
         help="Whether to apply low-pass filter to the upsampled actions (only works if `upsample` is set)",
     )
     parser.add_argument(
+        "--filter-mode",
+        choices=("causal", "zero-phase"),
+        default=os.getenv("ACTION_FILTER_MODE", "causal"),
+        help="with --filter: causal per-point or forward-backward over the known chunk",
+    )
+    parser.add_argument(
         "--control-hz",
         default=250.0,
         type=float,
@@ -408,6 +415,13 @@ def main():
         help="handoff duration in milliseconds (unset: full overlap; 0: no blend)",
     )
 
+    parser.add_argument(
+        "--mode",
+        choices=("blend", "switch"),
+        default=os.getenv("ACTION_EXECUTION_MODE", "blend"),
+        help="handoff operation; both modes honor optional action target timestamps",
+    )
+
     args = parser.parse_args()
     arms = args.arms.split(",")
 
@@ -418,6 +432,8 @@ def main():
             use_filter=args.filter,
             control_hz=args.control_hz,
             blend_duration_ms=args.blend_duration_ms,
+            mode=args.mode,
+            filter_mode=args.filter_mode,
         )
     )
 

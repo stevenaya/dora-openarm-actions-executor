@@ -33,8 +33,8 @@ The reader and executor run separately. Action and command queues each retain
 only their newest pending input, and command processing takes priority.
 
 ```text
-new chunk -> optional PCHIP -> blend with unsent old points
-          -> optional low-pass per emitted point -> split arms and send
+new chunk -> wait/align when target times are supplied -> PCHIP as needed
+          -> blend or switch -> optional low-pass -> split arms and send
 ```
 
 PCHIP is rebuilt for each chunk, preserves per-joint shape, and does not force
@@ -51,9 +51,11 @@ rebuild them.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `--mode` / `ACTION_EXECUTION_MODE` | `blend` | `blend` mixes trajectories; `switch` directly replaces them. Both support target times. |
 | `--arms` / `ARMS` | `right,left` | Active arms. |
 | `--upsample` | Off | PCHIP on the control-rate grid; adds a SciPy dependency. |
 | `--filter` | Off | Biquad after blend; requires upsampling. |
+| `--filter-mode` / `ACTION_FILTER_MODE` | `causal` | Per-point causal filter or experimental `zero-phase` chunk filtering. |
 | `--control-hz` | `250` | Target output rate while a trajectory has pending points. |
 | `--blend-duration-ms` / `ACTION_BLEND_DURATION_MS` | Unset | Blend full overlap; `0` disables blend. |
 
@@ -63,6 +65,48 @@ The old `--blend-max-steps` / `ACTION_BLEND_MAX_STEPS` options are removed:
 `N` policy points formerly spanned `(N - 1) * interval`, so four points at
 30 Hz correspond to about 100 ms. Blending now follows interpolation, so the
 numerical path is different.
+
+`zero-phase` runs SciPy `sosfiltfilt` on the already available control-rate chunk,
+preceded by up to three cutoff periods of previously sent **raw** targets. It does
+not wait for future observations. Output is filtered only once, after handoff/blend;
+history and RTC feedback never contain filtered outputs. Start/Stop/reset clear
+the filter context. Forward-backward filtering squares the magnitude response,
+so the same `cutoff_hz` is not an identical smoothing strength to `causal`.
+Finite chunk boundaries and replanning can still introduce command discontinuities;
+zero phase within a chunk is not a guarantee of seamless real-world handoffs.
+Recorded-chunk replay showed larger handoff jumps in `zero-phase`; use `causal`
+as the baseline when evaluating the pre-filter feedback fix.
+
+## Target Times and Feedback
+
+Without target times, both modes adopt immediately from the first supplied point.
+With `action_origin_timestamp_ns`, the first point is at
+`origin + action_window_start * interval`. `takeover_timestamp_ns` optionally
+specifies when adoption starts; alone it specifies the first point's target time.
+Zero/missing times mean immediate execution. Generation/ordinary timestamps are
+not action targets. Early chunks wait while the current trajectory continues;
+late chunks skip expired points. `max_lateness_ns` optionally bounds lateness,
+and entirely expired windows are rejected without interrupting the old trajectory.
+
+Timed blending samples both pre-filter trajectories on the same control grid.
+Weights start at the actual handoff and use the existing blend duration. Filtering
+is applied once, after mixing. `reset=true` prevents mixing with the old trajectory.
+
+`based_on_chunk_id` declares a dependency on the active plan (empty for bootstrap)
+and enables `execution_plan` feedback. Add that output to the dataflow and connect
+it to the policy node. Both modes publish the post-blend, **pre-filter** plan on adoption and
+acknowledge rejected dependent samples; no per-tick progress messages are sent.
+Start/Stop clear feedback. This is a target plan, not the driver's limited command
+or physical joint motion. Feeding filtered output back into another filter is avoided.
+Legacy streams require neither a dependency field nor an `execution_plan` output.
+RTC is model-side; its predictions may use either executor mode.
+
+After Start, the first action must match the attempt supplied by that command.
+Once a trajectory is active, an action with a new attempt ID is an in-place task
+switch: it replaces pending work and is treated as a reset chunk. The active
+trajectory continues until the new chunk is due. Feedback uses the adopted chunk's
+attempt ID. This assumes one ordered policy output source whose transport discards
+old-generation results; no extra task-control input is required.
 
 ## Metadata
 
@@ -83,7 +127,7 @@ or complete historical blend weights.
   replace the new chunk's sole target. Continuous single-target tracking is not
   implemented. A finished chunk has no remainder for later handoff blending.
 - Latest-only queues can replace pending commands or a `reset=true` chunk.
-  An unknown command interrupts playback without changing lifecycle state.
+  Unknown commands leave playback and lifecycle state unchanged.
 - Input shape/period validation and coordinated task-failure shutdown remain
   limited; a blocked reader can outlive an executor failure. Scheduling uses
   wall time and is not hard real-time. No sensor-time latency compensation or
