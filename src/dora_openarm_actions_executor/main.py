@@ -39,6 +39,13 @@ def _nonnegative_float(value):
     return parsed
 
 
+def _positive_float(value):
+    parsed = _nonnegative_float(value)
+    if parsed == 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
 # Tustin bilinear transform based biquad low-pass filter
 class BiquadLowpass:
     """Biquad low-pass filter for smoothing outputs."""
@@ -85,6 +92,37 @@ class BiquadLowpass:
         self.x2, self.x1 = self.x1, x
         self.y2, self.y1 = self.y1, y
         return y.astype(np.float32)
+
+
+class OneEuroLowpass:
+    """Per-joint One Euro filter on the fixed control-rate grid."""
+
+    def __init__(self, fs, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        """Configure the base cutoff and speed-dependent cutoff increase."""
+        self.fs, self.min_cutoff, self.beta = float(fs), float(min_cutoff), float(beta)
+        self.derivative_alpha = self._alpha(float(d_cutoff))
+        self.filtered = self.derivative = None
+
+    def _alpha(self, cutoff):
+        return 1.0 / (1.0 + self.fs / (2.0 * np.pi * cutoff))
+
+    def reset_state(self, initial_x):
+        """Start at the new reference without retaining its predecessor's speed."""
+        self.filtered = np.array(initial_x, dtype=np.float64, copy=True)
+        self.derivative = np.zeros_like(self.filtered)
+
+    def step(self, x):
+        """Update only for an emitted control point, independently per joint."""
+        x = np.asarray(x, dtype=np.float64)
+        if self.filtered is None:
+            self.reset_state(x)
+            return self.filtered.astype(np.float32)
+        # Match the reference algorithm's derivative from the previous filtered value.
+        velocity = (x - self.filtered) * self.fs
+        self.derivative += self.derivative_alpha * (velocity - self.derivative)
+        cutoff = self.min_cutoff + self.beta * np.abs(self.derivative)
+        self.filtered += self._alpha(cutoff) * (x - self.filtered)
+        return self.filtered.astype(np.float32)
 
 
 def _clear_queue(queue):
@@ -166,13 +204,26 @@ async def _main_executor(
     blend_duration_ms,
     mode="blend",
     filter_mode="causal",
+    filter_cutoff_hz=15.0,
+    filter_q=0.5,
+    one_euro_min_cutoff_hz=1.0,
+    one_euro_beta=0.0,
+    one_euro_d_cutoff_hz=1.0,
+    filter_grippers=True,
 ):
     if not use_upsample and use_filter:
         print("Warning: filter requires upsample; disabling filter.", flush=True)
         use_filter = False
+    filter_settings = (
+        f"min_cutoff_hz={one_euro_min_cutoff_hz}, beta={one_euro_beta}, "
+        f"d_cutoff_hz={one_euro_d_cutoff_hz}"
+        if filter_mode == "one-euro"
+        else f"filter_cutoff_hz={filter_cutoff_hz}, filter_q={filter_q}"
+    )
     print(
         f"actions-executor mode={mode}, blend_duration_ms={blend_duration_ms}, "
-        f"filter={filter_mode if use_filter else 'off'}",
+        f"filter={filter_mode if use_filter else 'off'}, "
+        f"{filter_settings}, filter_grippers={filter_grippers}",
         flush=True,
     )
     duration_ns = None if blend_duration_ms is None else round(blend_duration_ms * 1e6)
@@ -246,14 +297,18 @@ async def _main_executor(
             step_ns = control_interval if use_upsample else chunk.interval_ns
             scheduler.adopt(chunk, now_ns, step_ns, mode, duration_ns, use_upsample)
             if use_filter and lowpass is None:
-                cutoff = chunk.metadata.get("cutoff_hz", 15)
-                lowpass = BiquadLowpass(
-                    fs=control_hz, fc=cutoff
-                )
-                filter_history = deque(maxlen=max(9, int(3 * control_hz / cutoff)))
+                if filter_mode == "one-euro":
+                    lowpass = OneEuroLowpass(
+                        control_hz, one_euro_min_cutoff_hz, one_euro_beta, one_euro_d_cutoff_hz
+                    )
+                else:
+                    lowpass = BiquadLowpass(fs=control_hz, fc=filter_cutoff_hz, Q=filter_q)
+                if filter_mode == "zero-phase":
+                    filter_history = deque(maxlen=max(9, int(3 * control_hz / filter_cutoff_hz)))
             if chunk.metadata.get("reset") and lowpass is not None:
                 lowpass.reset_state(scheduler.active.positions[0])
-                filter_history.clear()
+                if filter_history is not None:
+                    filter_history.clear()
             if lowpass is not None and filter_mode == "zero-phase":
                 filtered_positions = _zero_phase_commands(
                     scheduler.active.positions, lowpass, filter_history
@@ -297,6 +352,8 @@ async def _main_executor(
                     position = filtered_positions[i_step]
                 else:
                     position = lowpass.step(position)
+                if not filter_grippers:
+                    position[7::8] = active.positions[i_step, 7::8]
             output_metadata = {**command_metadata, "timestamp": time.time_ns()}
             if (
                 scheduler.blended_chunk_id is not None
@@ -348,6 +405,12 @@ async def _main_async(
     blend_duration_ms,
     mode="blend",
     filter_mode="causal",
+    filter_cutoff_hz=15.0,
+    filter_q=0.5,
+    one_euro_min_cutoff_hz=1.0,
+    one_euro_beta=0.0,
+    one_euro_d_cutoff_hz=1.0,
+    filter_grippers=True,
 ):
     node = dora.Node()
     action_queue = asyncio.Queue(maxsize=1)
@@ -364,6 +427,12 @@ async def _main_async(
             blend_duration_ms,
             mode,
             filter_mode,
+            filter_cutoff_hz,
+            filter_q,
+            one_euro_min_cutoff_hz,
+            one_euro_beta,
+            one_euro_d_cutoff_hz,
+            filter_grippers,
         )
     )
     dora_task = asyncio.create_task(
@@ -397,15 +466,52 @@ def main():
         help="Whether to apply low-pass filter to the upsampled actions (only works if `upsample` is set)",
     )
     parser.add_argument(
+        "--filter-grippers",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("ACTION_FILTER_GRIPPERS", "true").strip().lower()
+        in ("1", "true", "yes", "on"),
+        help="filter grippers too; --no-filter-grippers keeps their pre-filter targets (default: enabled)",
+    )
+    parser.add_argument(
         "--filter-mode",
-        choices=("causal", "zero-phase"),
+        choices=("causal", "zero-phase", "one-euro"),
         default=os.getenv("ACTION_FILTER_MODE", "causal"),
-        help="with --filter: causal per-point or forward-backward over the known chunk",
+        help="with --filter: causal/zero-phase biquad, or adaptive one-euro",
+    )
+    parser.add_argument(
+        "--filter-cutoff-hz",
+        type=_positive_float,
+        default=os.getenv("ACTION_FILTER_CUTOFF_HZ", "15"),
+        help="biquad cutoff parameter in Hz; ignores action cutoff_hz metadata (default: 15)",
+    )
+    parser.add_argument(
+        "--filter-q",
+        type=_positive_float,
+        default=os.getenv("ACTION_FILTER_Q", "0.5"),
+        help="biquad Q factor (default: 0.5)",
+    )
+    parser.add_argument(
+        "--one-euro-min-cutoff-hz",
+        type=_positive_float,
+        default=os.getenv("ACTION_ONE_EURO_MIN_CUTOFF_HZ", "1"),
+        help="One Euro base cutoff (Hz, default: 1)",
+    )
+    parser.add_argument(
+        "--one-euro-beta",
+        type=_nonnegative_float,
+        default=os.getenv("ACTION_ONE_EURO_BETA", "0"),
+        help="One Euro speed coefficient; zero disables adaptation (default: 0)",
+    )
+    parser.add_argument(
+        "--one-euro-d-cutoff-hz",
+        type=_positive_float,
+        default=os.getenv("ACTION_ONE_EURO_D_CUTOFF_HZ", "1"),
+        help="One Euro derivative cutoff (Hz, default: 1)",
     )
     parser.add_argument(
         "--control-hz",
         default=250.0,
-        type=float,
+        type=_positive_float,
         help="motor control frequency (Hz)",
     )
     parser.add_argument(
@@ -423,6 +529,9 @@ def main():
     )
 
     args = parser.parse_args()
+    if (args.filter and args.upsample and args.filter_mode != "one-euro"
+            and args.filter_cutoff_hz >= args.control_hz / 2):
+        parser.error("--filter-cutoff-hz must be less than half --control-hz")
     arms = args.arms.split(",")
 
     asyncio.run(
@@ -434,6 +543,12 @@ def main():
             blend_duration_ms=args.blend_duration_ms,
             mode=args.mode,
             filter_mode=args.filter_mode,
+            filter_cutoff_hz=args.filter_cutoff_hz,
+            filter_q=args.filter_q,
+            one_euro_min_cutoff_hz=args.one_euro_min_cutoff_hz,
+            one_euro_beta=args.one_euro_beta,
+            one_euro_d_cutoff_hz=args.one_euro_d_cutoff_hz,
+            filter_grippers=args.filter_grippers,
         )
     )
 

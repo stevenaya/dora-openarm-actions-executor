@@ -261,32 +261,58 @@ def test_zero_phase_has_no_interior_phase_shift_or_repeated_filtering():
         np.testing.assert_allclose(_zero_phase_commands(np.ones((count,16)),lowpass,[]),1)
 
 
-@pytest.mark.parametrize("filter_mode", ["causal", "zero-phase"])
-def test_feedback_stays_raw_while_final_output_is_filtered(filter_mode):
+@pytest.mark.parametrize("filter_mode", ["causal", "zero-phase", "one-euro"])
+@pytest.mark.parametrize("filter_grippers", [True, False])
+@pytest.mark.parametrize("arms", [["right"], ["left"], ["right", "left"]])
+def test_feedback_stays_raw_while_final_output_is_filtered(filter_mode, filter_grippers, arms):
+    from dora_openarm_actions_executor.main import OneEuroLowpass
+
     async def run():
         actions, commands = asyncio.Queue(maxsize=1), asyncio.Queue()
-        done, plans, sent = asyncio.Event(), [], []
+        done, plans = asyncio.Event(), []
+        sent = {side: [] for side in arms}
 
         class Node:
             def send_output(self, name, value, metadata):
                 if name == "execution_plan":
                     plans.append(value[0].as_py())
-                elif name == "move_position_right":
-                    sent.append(value[0].as_py()["qpos"])
-                    if len(sent) == 8:
+                elif name.startswith("move_position_"):
+                    side = name.removeprefix("move_position_")
+                    sent[side].append(value[0].as_py()["qpos"])
+                    if side == arms[0] and len(sent[side]) == 8:
                         done.set()
 
         commands.put_nowait({"value": pa.array(["start"]), "metadata": {}})
-        task = asyncio.create_task(_main_executor(Node(), actions, commands, ["right"],
-            True, True, 250, None, mode="switch", filter_mode=filter_mode))
+        task = asyncio.create_task(_main_executor(Node(), actions, commands, arms,
+            True, True, 250, None, mode="switch", filter_mode=filter_mode,
+            filter_cutoff_hz=8, filter_q=0.6,
+            one_euro_min_cutoff_hz=5, one_euro_beta=0.5, one_euro_d_cutoff_hz=1,
+            filter_grippers=filter_grippers))
         try:
             await asyncio.sleep(0)
-            incoming = event((0, 1, 1, 0, 0), interval=33_333_333, reset=True, based_on_chunk_id="")
+            incoming = event((0, 1, 1, 0, 0), interval=33_333_333, reset=True,
+                             based_on_chunk_id="", cutoff_hz=80)
+            incoming["value"] = pa.array(
+                [row[:8 * len(arms)] for row in incoming["value"].to_pylist()],
+                type=pa.list_(pa.float32()),
+            )
             actions.put_nowait(incoming)
             await asyncio.wait_for(done.wait(), 2)
             raw = _upsample_trajectory(Chunk.from_event(incoming).positions,33_333_333,4_000_000)
             np.testing.assert_array_equal(plans[0]["positions"],raw)
-            assert not np.allclose(np.asarray(sent)[:,0],raw[:len(sent),0])
+            output = np.concatenate([sent[side] for side in arms], axis=1)
+            assert not np.allclose(output[:,0],raw[:len(output),0])
+            reference = (OneEuroLowpass(250, min_cutoff=5, beta=0.5, d_cutoff=1)
+                         if filter_mode == "one-euro" else BiquadLowpass(250, 8, Q=0.6))
+            expected = (
+                _zero_phase_commands(raw, reference, [])[:len(output)]
+                if filter_mode == "zero-phase"
+                else np.asarray([reference.step(point) for point in raw[:len(output)]])
+            )
+            if not filter_grippers:
+                expected[:, 7::8] = raw[:len(output), 7::8]
+                np.testing.assert_array_equal(output[:, 7::8], raw[:len(output), 7::8])
+            np.testing.assert_allclose(output, expected, atol=1e-6)
         finally:
             task.cancel()
             await asyncio.gather(task,return_exceptions=True)

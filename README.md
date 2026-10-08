@@ -24,7 +24,8 @@ wire the arm/driver lifecycle separately.
 `actions` is an Arrow `list<float32>` array of shape `[T, D]`: 8 values per
 arm (7 joints and a gripper), right arm then left for bimanual input. Metadata
 requires `interval` in nanoseconds between policy points; optional fields are
-`cutoff_hz` (default 15 Hz), `reset`, and `chunk_id`. Each arm output is a
+`reset` and `chunk_id`. Legacy `cutoff_hz` metadata is ignored: filter settings
+belong to this executor. Each arm output is a
 length-one struct `[{"qpos": [...]}]` containing `list<float32>`.
 
 ## Execution
@@ -40,24 +41,36 @@ new chunk -> wait/align when target times are supplied -> PCHIP as needed
 PCHIP is rebuilt for each chunk, preserves per-joint shape, and does not force
 endpoint velocities to zero. The fixed-period grid covers the horizon; its last
 sample holds the exact final pose without extrapolation. Already sent points
-are not replayed. The optional biquad uses `Q=0.5` to reduce ringing compared
+are not replayed. The optional biquad defaults to `Q=0.5` to reduce ringing compared
 with `0.707`, with a slower response at the same frequency parameter.
 Interpolation guarantees apply before blending/filtering, not to physical motion.
 
 Ordinary handoffs retain filter state. `reset=true` discards the old remainder
-and initializes the filter at the new first pose. Filter coefficients come from
-the first chunk after a lifecycle command; changing `cutoff_hz` alone does not
-rebuild them.
+and initializes the filter at the new first pose. Biquad coefficients are computed
+from the executor's cutoff, Q and control rate. CLI options override environment
+defaults; restart the executor to change them. Start/Stop resets filter state,
+not configuration.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--mode` / `ACTION_EXECUTION_MODE` | `blend` | `blend` mixes trajectories; `switch` directly replaces them. Both support target times. |
 | `--arms` / `ARMS` | `right,left` | Active arms. |
 | `--upsample` | Off | PCHIP on the control-rate grid; adds a SciPy dependency. |
-| `--filter` | Off | Biquad after blend; requires upsampling. |
-| `--filter-mode` / `ACTION_FILTER_MODE` | `causal` | Per-point causal filter or experimental `zero-phase` chunk filtering. |
+| `--filter` | Off | Filter after blend; requires upsampling. |
+| `--[no-]filter-grippers` / `ACTION_FILTER_GRIPPERS` | `true` | Include grippers in final filtering; false preserves their post-upsampling/blend targets. |
+| `--filter-mode` / `ACTION_FILTER_MODE` | `causal` | `causal` or `zero-phase` biquad, or adaptive `one-euro`. |
+| `--filter-cutoff-hz` / `ACTION_FILTER_CUTOFF_HZ` | `15` | Positive, finite biquad frequency parameter; below half `control-hz` when filtering. |
+| `--filter-q` / `ACTION_FILTER_Q` | `0.5` | Positive, finite biquad Q factor, shared by the two biquad modes. |
+| `--one-euro-min-cutoff-hz` / `ACTION_ONE_EURO_MIN_CUTOFF_HZ` | `1` | Positive, finite One Euro base cutoff (Hz). |
+| `--one-euro-beta` / `ACTION_ONE_EURO_BETA` | `0` | Nonnegative, finite speed coefficient; zero means fixed-cutoff first-order smoothing. |
+| `--one-euro-d-cutoff-hz` / `ACTION_ONE_EURO_D_CUTOFF_HZ` | `1` | Positive, finite cutoff for the derivative estimate (Hz). |
 | `--control-hz` | `250` | Target output rate while a trajectory has pending points. |
 | `--blend-duration-ms` / `ACTION_BLEND_DURATION_MS` | Unset | Blend full overlap; `0` disables blend. |
+
+`--no-filter-grippers` applies to all three filter modes. It bypasses final
+filtering for index 7 of each 8-value arm block (7 and 15 for bimanual input).
+Upsampling, blend and pre-filter RTC feedback remain unchanged. In experiment
+YAML, set `launch.env.action_filter_grippers: "false"` and restart the executor.
 
 Blend duration rounds up to an execution period and is clipped by available
 overlap. Without upsampling, the execution period is the policy interval.
@@ -71,11 +84,32 @@ preceded by up to three cutoff periods of previously sent **raw** targets. It do
 not wait for future observations. Output is filtered only once, after handoff/blend;
 history and RTC feedback never contain filtered outputs. Start/Stop/reset clear
 the filter context. Forward-backward filtering squares the magnitude response,
-so the same `cutoff_hz` is not an identical smoothing strength to `causal`.
+so the same `--filter-cutoff-hz` is not an identical smoothing strength to `causal`.
 Finite chunk boundaries and replanning can still introduce command discontinuities;
 zero phase within a chunk is not a guarantee of seamless real-world handoffs.
 Recorded-chunk replay showed larger handoff jumps in `zero-phase`; use `causal`
 as the baseline when evaluating the pre-filter feedback fix.
+
+`one-euro` follows the [author's reference algorithm](https://gery.casiez.net/1euro/)
+independently for each joint: `cutoff = min_cutoff + beta * abs(filtered_speed)`.
+It uses the fixed `control_hz` grid, not policy inference frequency or wall-clock
+jitter. It updates only on emitted points, carries state across handoffs, and
+clears both position and derivative state on reset. RTC feedback stays pre-filter.
+Biquad cutoff/Q do not apply in this mode; One Euro is not combined with zero-phase.
+Beta depends on position units, so tuning for radians need not fit gripper units.
+For a workspace experiment, an initial trial configuration is:
+
+```yaml
+launch:
+  env:
+    action_filter_mode: one-euro
+    action_one_euro_min_cutoff_hz: 5.0
+    action_one_euro_beta: 0.5
+    action_one_euro_d_cutoff_hz: 1.0
+```
+
+These are trial values, not robot tuning guarantees. Restart the executor after
+changing them. Existing `--filter` / `--upsample` switches must remain enabled.
 
 ## Target Times and Feedback
 
