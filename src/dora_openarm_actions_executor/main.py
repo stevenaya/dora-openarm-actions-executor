@@ -234,19 +234,30 @@ async def _main_executor(
     filter_history = filtered_positions = None
     publish_plan = False
 
-    def send_plan(value):
+    def send_plan(value, attempt_id=None):
+        if attempt_id is None:
+            attempt_id = scheduler.attempt_id
         metadata = (
             {}
-            if scheduler.attempt_id is None
-            else {"episode_attempt_id": scheduler.attempt_id}
+            if attempt_id is None
+            else {"episode_attempt_id": attempt_id}
         )
         node.send_output("execution_plan", pa.array([value]), metadata)
 
-    def feedback(metadata):
+    def feedback(metadata, status="adopted", reason=None):
         # A rejection still acknowledges the sample, even with no adopted plan yet.
         nonlocal plan
         value = dict(plan) if plan is not None else {"chunk_id": "", "positions": []}
         value["sample_chunk_id"] = metadata.get("chunk_id")
+        for key in ("execution_status", "feedback_timestamp_ns", "completed_timestamp_ns", "rejection_reason"):
+            value.pop(key, None)
+        if metadata.get("inference_mode") == "stop-and-go":
+            value["execution_status"] = status
+            value["feedback_timestamp_ns"] = time.time_ns()
+            if status == "completed":
+                value["completed_timestamp_ns"] = value["feedback_timestamp_ns"]
+            if reason is not None:
+                value["rejection_reason"] = reason
         for source, target in (
             ("executor_received_timestamp_ns", "received_timestamp_ns"),
             ("inference_started_timestamp_ns", "inference_started_timestamp_ns"),
@@ -254,14 +265,18 @@ async def _main_executor(
             value.pop(target, None)
             if source in metadata:
                 value[target] = metadata[source]
-        send_plan(value)
+        send_plan(value, metadata.get("episode_attempt_id")
+                  if metadata.get("inference_mode") == "stop-and-go" else None)
         if plan is not None:
             plan = value
 
     def reject(chunk, reason):
         print(f"Dropped chunk={chunk.metadata.get('chunk_id')}: {reason}", flush=True)
-        if reason != "episode changed" and "based_on_chunk_id" in chunk.metadata:
-            feedback(chunk.metadata)
+        if reason != "episode changed" and (
+            "based_on_chunk_id" in chunk.metadata
+            or chunk.metadata.get("inference_mode") == "stop-and-go"
+        ):
+            feedback(chunk.metadata, "rejected", reason)
 
     while True:
         if (
@@ -313,7 +328,10 @@ async def _main_executor(
                 filtered_positions = _zero_phase_commands(
                     scheduler.active.positions, lowpass, filter_history
                 )
-            publish_plan = plan is not None or "based_on_chunk_id" in chunk.metadata
+            publish_plan = (
+                plan is not None or "based_on_chunk_id" in chunk.metadata
+                or chunk.metadata.get("inference_mode") == "stop-and-go"
+            )
             command_metadata = {}
             chunk_id = chunk.metadata.get("chunk_id")
             if chunk_id is not None:
@@ -370,6 +388,11 @@ async def _main_executor(
                     )
                     offset += 8
             scheduler.cursor += 1
+            if (scheduler.cursor == len(active.positions)
+                    and active.metadata.get("inference_mode") == "stop-and-go"):
+                # Both arms' final commands have been sent. Hold those targets until
+                # the next chunk; this is not a physical joint-settling acknowledgement.
+                feedback(active.metadata, "completed")
 
         deadlines = []
         if scheduler.next_timestamp_ns is not None:

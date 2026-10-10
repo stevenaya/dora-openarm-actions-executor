@@ -135,6 +135,17 @@ or physical joint motion. Feeding filtered output back into another filter is av
 Legacy streams require neither a dependency field nor an `execution_plan` output.
 RTC is model-side; its predictions may use either executor mode.
 
+For synchronous stop-and-go, action metadata `inference_mode: stop-and-go` also
+enables `execution_plan` feedback without `based_on_chunk_id`. Feedback carries
+`execution_status` (`adopted`, `completed`, or `rejected`), `sample_chunk_id`, and
+`feedback_timestamp_ns`. The executor emits `completed` exactly once after the
+final command has been sent to every configured arm, adding
+`completed_timestamp_ns`. It then holds the last target until another chunk
+arrives; it does not issue a motor Stop command per chunk. Completion describes
+command dispatch, not physical settling or attainment of the unfiltered endpoint.
+Rejected samples include `rejection_reason`. Stop/intervene/quit clears the plan
+without reporting a partially executed chunk as completed.
+
 After Start, the first action must match the attempt supplied by that command.
 Once a trajectory is active, an action with a new attempt ID is an in-place task
 switch: it replaces pending work and is treated as a reset chunk. The active
